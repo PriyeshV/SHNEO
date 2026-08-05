@@ -1,0 +1,30 @@
+# JAX is installed separately with the correct GPU extra.
+
+# uv python install 3.11
+# uv venv --python 3.11 "$HOME/virtualenvs/pybrax_uv"
+# source "$HOME/virtualenvs/pybrax_uv/bin/activate"
+
+# uv pip install --upgrade "jax[cuda12]"
+# uv pip install -r requirements-brax.txt
+
+
+brax==0.14.2
+
+# Packages imported directly by the Reliable NEO/SAC code
+flax
+optax
+chex
+orbax-checkpoint
+ml-collections
+
+# Numerics and utilities
+numpy
+scipy
+PyYAML
+rich
+tqdm
+typing_extensions
+
+# Experiment logging
+wandb
+tensorboardX
