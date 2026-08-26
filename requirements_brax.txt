@@ -1,11 +1,20 @@
 # JAX is installed separately with the correct GPU extra.
+#
+# Python 3.11+ is required: brax 0.14.2 declares requires_python >=3.11, so a
+# cluster module that only offers 3.10 will not work.  uv can supply its own.
 
 # uv python install 3.11
 # uv venv --python 3.11 "$HOME/virtualenvs/pybrax_uv"
 # source "$HOME/virtualenvs/pybrax_uv/bin/activate"
 
 # uv pip install --upgrade "jax[cuda12]"
-# uv pip install -r requirements-brax.txt
+# uv pip install -r requirements_brax.txt
+
+# AntMaze additionally needs JaxGCRL, which is deliberately NOT listed below:
+# it hard-pins jax==0.4.25 and mujoco==3.2.7, which would downgrade jax and
+# break brax.  src/mains/ant_maze/sac_utils.py only ever loads its
+# jaxgcrl.envs.ant_maze submodule, so install it without its dependencies:
+# uv pip install --no-deps jaxgcrl
 
 
 brax==0.14.2
@@ -24,6 +33,11 @@ PyYAML
 rich
 tqdm
 typing_extensions
+
+# src/utils/utils.py imports these at module scope, so every entry point that
+# touches src.config.common.arg_helpers needs them present.
+matplotlib
+Pillow
 
 # Experiment logging
 wandb
