@@ -98,6 +98,12 @@ class PixelAntMazeWrapper(envs.Wrapper):
     preserves locomotion/pose novelty that a single agent dot would discard.
     """
 
+    # ``ensure_pixel_ant_maze`` walks an environment chain looking for this
+    # marker before adding another renderer.  ``brax.envs.Wrapper.__getattr__``
+    # forwards unknown attributes to the wrapped environment, so outer wrappers
+    # report it too and the idempotency check sees the whole chain.
+    is_pixel_ant_maze_wrapper: bool = True
+
     def __init__(
         self,
         env,

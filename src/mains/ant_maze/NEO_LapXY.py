@@ -225,11 +225,16 @@ class SNEOExplorer:
         action_size,
         target_network,
         predictor_network,
+        rnd_input="state",
     ):
         if obs_size <= _GOAL_DIMS:
             raise ValueError("SAC_NEO requires state followed by two goal coordinates")
         self.args = args
         self.rnd = rnd
+        # Space the shared RND novelty model is defined over.  ``xy`` puts RND
+        # in the same low-dimensional space as this Laplacian, which is what
+        # makes the reliability weighting informative about maze coverage.
+        self.rnd_input = rnd_input
         self.obs_size = obs_size
         self.option_obs_size = obs_size - _GOAL_DIMS
         self.action_size = action_size
@@ -402,6 +407,11 @@ class SNEOExplorer:
             option_steps_left=jnp.where(reset, 0, steps_left),
         )
 
+    def _burnin(self, train_state):
+        """True while the RND intrinsic reward is still forced to zero."""
+
+        return train_state.env_steps < self.rnd.obs_burnin
+
     def _normalized_novelty(self, train_state, observations, pixels=None):
         raw = _rnd_intrinsic_reward(
             train_state,
@@ -409,10 +419,28 @@ class SNEOExplorer:
             self.predictor_network,
             observations,
             pixels,
+            self.rnd_input,
         )
         novelty = raw / jnp.maximum(train_state.rnd_rew_rms.std, 1e-8)
-        burnin = train_state.env_steps < self.rnd.obs_burnin
-        return jnp.where(burnin, jnp.zeros_like(novelty), novelty)
+        return jnp.where(
+            self._burnin(train_state), jnp.zeros_like(novelty), novelty
+        )
+
+    def _lap_novelty(self, train_state, novelty):
+        """Novelty weights for the Laplacian, made safe during RND burn-in.
+
+        ``compute_multi_step_graph_drawing_loss`` normalizes its novelty
+        weights both across time and across the batch.  An all-zero novelty
+        vector therefore does not merely down-weight the attractive term, it
+        annihilates it: ``w_time`` and ``row_w`` both collapse to 0 and the
+        Laplacian objective degenerates to the orthogonality barrier alone.
+        Feed uniform weights while novelty is identically zero so burn-in
+        trains the plain (unweighted) graph-drawing objective instead.
+        """
+
+        return jnp.where(
+            self._burnin(train_state), jnp.ones_like(novelty), novelty
+        )
 
     def _zeta(self, extra, novelty):
         novelty_n = jnp.clip(
@@ -464,11 +492,20 @@ class SNEOExplorer:
 
         xy0 = self._lap_obs(transitions.observation)
         xy1 = self._lap_obs(transitions.next_observation)
+        # Brax's AutoResetWrapper overwrites next_observation with the
+        # episode's *initial* observation whenever done, so a done transition
+        # is not a graph edge: keeping it would wire every terminal state to
+        # the maze start.  JaxGCRL AntMaze terminates on unhealthy z as well
+        # as on the time limit, so this is not a rare event early in training
+        # and ``1 - truncation`` misses all of it.  ``discount`` is
+        # ``1 - done`` and covers both cases.
+        edge_valid = transitions.discount
+        lap_novelty = self._lap_novelty(train_state, novelty1)
 
         def lap_loss(params):
             phi0 = self.lap_network.apply({"params": params}, xy0)
             phi1 = self.lap_network.apply({"params": params}, xy1)
-            valid = 1.0 - transitions.extras["state_extras"]["truncation"]
+            valid = edge_valid
             total, (positive, ortho, dual_diagnostic), (_, error_matrix) = multi_step_ALLO(
                 key=key,
                 phis_all=phi0,
@@ -479,7 +516,7 @@ class SNEOExplorer:
                 barrier_coeffs=extra.barrier_coeffs,
                 betas=extra.betas,
                 weights=None,
-                novelty_values=novelty1[:, None],
+                novelty_values=lap_novelty[:, None],
                 zeta_values=jnp.stack([zeta0, zeta1], axis=1),
                 use_novelty=self.config.lap_novel_weight,
                 use_zeta=True,
@@ -501,7 +538,7 @@ class SNEOExplorer:
             eig_reward = (
                 jnp.abs(phi1[:, : self.config.n_options])
                 - jnp.abs(phi0[:, : self.config.n_options])
-            )
+            ) * edge_valid[:, None]
             return total, (
                 positive,
                 ortho,
@@ -582,7 +619,7 @@ class SNEOExplorer:
             eig_reward = jax.lax.stop_gradient(
                 jnp.abs(phi1[:, : self.config.n_options])
                 - jnp.abs(phi0[:, : self.config.n_options])
-            )
+            ) * edge_valid[:, None]
             zero = jnp.asarray(0.0, dtype=jnp.float32)
             return (
                 extra.lap_params,
@@ -683,8 +720,9 @@ class SNEOExplorer:
             transitions.action.shape[:-1]
             + (self.config.n_options, transitions.action.shape[-1]),
         )
-        if self.args.env.pixel_obs:
-            # Already computed from the correct next-state pixels during collection.
+        if self.rnd_input == "pixels":
+            # Frames are not stored in replay, so reuse the value computed from
+            # the correct next-state pixels during collection.
             novelty = transitions.extras["rnd_reward"]
         else:
             novelty = self._normalized_novelty(
@@ -700,10 +738,12 @@ class SNEOExplorer:
         phi1 = self.lap_network.apply(
             {"params": extra.lap_params}, self._lap_obs(transitions.next_observation)
         )
+        # Zero on a done transition: AutoResetWrapper made next_observation the
+        # reset state, so the magnitude difference across it is meaningless.
         eig_reward = jax.lax.stop_gradient(
             jnp.abs(phi1[:, : self.config.n_options])
             - jnp.abs(phi0[:, : self.config.n_options])
-        )
+        ) * transitions.discount[..., None]
 
         def alpha_loss(log_alpha):
             _, log_prob = self._sample_options(

@@ -238,6 +238,7 @@ class SNEOExplorer:
         action_size,
         target_network,
         predictor_network,
+        rnd_input="state",
     ):
         if not getattr(args.env, "pixel_obs", False):
             raise ValueError(
@@ -248,6 +249,9 @@ class SNEOExplorer:
             raise ValueError("SAC_NEO requires state followed by two goal coordinates")
         self.args = args
         self.rnd = rnd
+        # Space the shared RND novelty model is defined over; the Laplacian
+        # here is always the pixel encoder, but RND may use "xy" or "state".
+        self.rnd_input = rnd_input
         self.obs_size = obs_size
         self.option_obs_size = obs_size - _GOAL_DIMS
         self.action_size = action_size
@@ -317,7 +321,6 @@ class SNEOExplorer:
         previous_pixels,
         next_pixels,
     ):
-        del transitions
         lap0 = self._lap_pixels(self._compress_lap_pixels(previous_pixels))
         lap1 = self._lap_pixels(self._compress_lap_pixels(next_pixels))
         phi0 = self.lap_network.apply({"params": extra.lap_params}, lap0)
@@ -326,6 +329,11 @@ class SNEOExplorer:
             jnp.abs(phi1[:, : self.config.n_options])
             - jnp.abs(phi0[:, : self.config.n_options])
         )
+        # AutoResetWrapper makes ``next_pixels`` the reset frame on a done
+        # step, so the magnitude difference across that boundary is not an
+        # eigen-reward.  Zero is the correct terminal reward for the option
+        # critics, which also stop bootstrapping there through ``discount``.
+        eig_reward = eig_reward * transitions.discount[:, None]
         return {"eig_reward": eig_reward}
 
     def _sample_options(self, params, observation, key, normalizer_params=None):
@@ -472,6 +480,11 @@ class SNEOExplorer:
             option_steps_left=jnp.where(reset, 0, steps_left),
         )
 
+    def _burnin(self, train_state):
+        """True while the RND intrinsic reward is still forced to zero."""
+
+        return train_state.env_steps < self.rnd.obs_burnin
+
     def _normalized_novelty(self, train_state, observations, pixels=None):
         raw = _rnd_intrinsic_reward(
             train_state,
@@ -479,10 +492,28 @@ class SNEOExplorer:
             self.predictor_network,
             observations,
             pixels,
+            self.rnd_input,
         )
         novelty = raw / jnp.maximum(train_state.rnd_rew_rms.std, 1e-8)
-        burnin = train_state.env_steps < self.rnd.obs_burnin
-        return jnp.where(burnin, jnp.zeros_like(novelty), novelty)
+        return jnp.where(
+            self._burnin(train_state), jnp.zeros_like(novelty), novelty
+        )
+
+    def _lap_novelty(self, train_state, novelty):
+        """Novelty weights for the Laplacian, made safe during RND burn-in.
+
+        ``compute_multi_step_graph_drawing_loss`` normalizes its novelty
+        weights both across time and across the batch.  An all-zero novelty
+        vector therefore does not merely down-weight the attractive term, it
+        annihilates it: ``w_time`` and ``row_w`` both collapse to 0 and the
+        Laplacian objective degenerates to the orthogonality barrier alone.
+        Feed uniform weights while novelty is identically zero so burn-in
+        trains the plain (unweighted) graph-drawing objective instead.
+        """
+
+        return jnp.where(
+            self._burnin(train_state), jnp.ones_like(novelty), novelty
+        )
 
     def _zeta(self, extra, novelty):
         novelty_n = jnp.clip(
@@ -538,11 +569,20 @@ class SNEOExplorer:
             )
         lap0 = self._lap_pixels(self._compress_lap_pixels(pixels0))
         lap1 = self._lap_pixels(self._compress_lap_pixels(pixels1))
+        # Brax's AutoResetWrapper overwrites next_observation (and, through
+        # ``_pixels_reset``, the next frame) with the episode's *initial*
+        # state whenever done.  Those pairs are not graph edges: keeping them
+        # would wire every terminal state to the maze start.  JaxGCRL AntMaze
+        # terminates on unhealthy z as well as on the time limit, so this is
+        # not a rare event early in training and ``1 - truncation`` misses all
+        # of it.  ``discount`` is ``1 - done`` and covers both cases.
+        edge_valid = transitions.discount
+        lap_novelty = self._lap_novelty(train_state, novelty1)
 
         def lap_loss(params):
             phi0 = self.lap_network.apply({"params": params}, lap0)
             phi1 = self.lap_network.apply({"params": params}, lap1)
-            valid = 1.0 - transitions.extras["state_extras"]["truncation"]
+            valid = edge_valid
             total, (positive, ortho, dual_diagnostic), (_, error_matrix) = multi_step_ALLO(
                 key=key,
                 phis_all=phi0,
@@ -553,7 +593,7 @@ class SNEOExplorer:
                 barrier_coeffs=extra.barrier_coeffs,
                 betas=extra.betas,
                 weights=None,
-                novelty_values=novelty1[:, None],
+                novelty_values=lap_novelty[:, None],
                 zeta_values=jnp.stack([zeta0, zeta1], axis=1),
                 use_novelty=self.config.lap_novel_weight,
                 use_zeta=True,
@@ -575,7 +615,7 @@ class SNEOExplorer:
             eig_reward = (
                 jnp.abs(phi1[:, : self.config.n_options])
                 - jnp.abs(phi0[:, : self.config.n_options])
-            )
+            ) * edge_valid[:, None]
             return total, (
                 positive,
                 ortho,
@@ -749,10 +789,17 @@ class SNEOExplorer:
             transitions.action.shape[:-1]
             + (self.config.n_options, transitions.action.shape[-1]),
         )
-        # Full-resolution RND frames are intentionally not stored in replay.
-        # Use the normalized intrinsic reward computed online at collection
-        # time instead of incorrectly feeding vector observations to a CNN.
-        novelty = transitions.extras["rnd_reward"]
+        if self.rnd_input == "pixels":
+            # Full-resolution RND frames are intentionally not stored in
+            # replay, so reuse the reward computed online at collection time
+            # instead of incorrectly feeding vector observations to a CNN.
+            novelty = transitions.extras["rnd_reward"]
+        else:
+            # A vector RND model can be re-evaluated on the replayed state,
+            # which removes the staleness of the stored bonus.
+            novelty = self._normalized_novelty(
+                train_state, transitions.next_observation
+            )
         novelty_n = jnp.clip(
             novelty / (extra.rnd_bonus_max_ema + 1e-8), 0.0, 1.0
         )

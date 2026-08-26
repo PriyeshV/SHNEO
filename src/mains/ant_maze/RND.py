@@ -2,10 +2,17 @@
 
 This follows the repository's PQN_RND decomposition: separate extrinsic and
 intrinsic twin critics are learned, while one stochastic actor maximizes
-``min(Q_ext) + a_int_coef * min(Q_int)``.  By default the RND
-target/predictor are MLPs over goal-free state.  With ``--e_pixel_obs True``
-they use convolutional networks over PixelAntMaze frames instead, while the
-SAC actor and critics keep the same vector observation as the baseline.
+``min(Q_ext) + a_int_coef * min(Q_int)``.  ``--r_input`` selects the space
+the RND target/predictor are defined over: ``state`` (goal-free ant state,
+the default), ``xy`` (torso position only), or ``pixels`` (a PixelAntMaze
+frame through convolutional encoders, requires ``--e_pixel_obs True``).  The
+SAC actor and critics always keep the same vector observation as the
+baseline, so only the novelty model changes.
+
+On AntMaze prefer ``--r_input xy`` for vector runs: the full ant state is
+dominated by joint angles and velocities that stay novel indefinitely, so
+``state`` novelty carries very little information about which part of the
+maze has actually been visited.
 
 The surrounding environment, evaluation, replay, batching, and logging flow
 tracks Brax SAC so SAC.py and SAC_RND.py remain directly comparable.
@@ -248,7 +255,13 @@ PRNGKey = types.PRNGKey
 Params = types.Params
 ReplayBufferState = Any
 _PMAP_AXIS_NAME = "i"
+# JaxGCRL AntMaze builds its observation as
+# ``concat([qpos[:-2], qvel[:-2], target_xy])`` with
+# ``exclude_current_positions_from_observation=False``, so the torso x/y are
+# the first two entries and the desired goal is the last two.
 _ANTMAZE_GOAL_DIMS = 2
+_ANTMAZE_XY_DIMS = 2
+RND_INPUTS = ("state", "xy", "pixels")
 
 
 class RNDTarget(nn.Module):
@@ -338,10 +351,47 @@ def _rnd_observation(obs: jax.Array) -> jax.Array:
     return obs[..., :-_ANTMAZE_GOAL_DIMS]
 
 
-def _rnd_input(obs: jax.Array, pixels: jax.Array | None = None) -> jax.Array:
-    """Selects pixel RND input, otherwise strips the vector goal entries."""
+def _rnd_xy(obs: jax.Array) -> jax.Array:
+    """Keep only the torso x/y position."""
 
-    return pixels if pixels is not None else _rnd_observation(obs)
+    return obs[..., :_ANTMAZE_XY_DIMS]
+
+
+def rnd_input_shape(mode: str, obs_size: int, pixel_size: int) -> Tuple[int, ...]:
+    """Per-sample shape of the RND target/predictor input for ``mode``."""
+
+    if mode == "pixels":
+        return (pixel_size, pixel_size, 3)
+    if mode == "xy":
+        return (_ANTMAZE_XY_DIMS,)
+    if mode == "state":
+        if obs_size <= _ANTMAZE_GOAL_DIMS:
+            raise ValueError(
+                "AntMaze observation must contain state plus two goal coordinates"
+            )
+        return (obs_size - _ANTMAZE_GOAL_DIMS,)
+    raise ValueError(f"unknown r_input {mode!r}; choose one of {RND_INPUTS}")
+
+
+def _rnd_input(
+    obs: jax.Array,
+    pixels: jax.Array | None = None,
+    mode: str = "state",
+) -> jax.Array:
+    """Selects the observation space the novelty model is defined over."""
+
+    if mode == "pixels":
+        if pixels is None:
+            raise ValueError(
+                "r_input=pixels but no PixelAntMaze frame was supplied; "
+                "enable --e_pixel_obs True"
+            )
+        return pixels
+    if mode == "xy":
+        return _rnd_xy(obs)
+    if mode == "state":
+        return _rnd_observation(obs)
+    raise ValueError(f"unknown r_input {mode!r}; choose one of {RND_INPUTS}")
 
 
 def _rnd_normalize_input(
@@ -358,8 +408,9 @@ def _rnd_normalize_obs(
     state: TrainingState,
     obs: jax.Array,
     pixels: jax.Array | None = None,
+    mode: str = "state",
 ) -> jax.Array:
-    return _rnd_normalize_input(state, _rnd_input(obs, pixels))
+    return _rnd_normalize_input(state, _rnd_input(obs, pixels, mode))
 
 
 def _rnd_intrinsic_reward(
@@ -368,8 +419,9 @@ def _rnd_intrinsic_reward(
     predictor_network: RNDPredictor,
     obs: jax.Array,
     pixels: jax.Array | None = None,
+    mode: str = "state",
 ) -> jax.Array:
-    normalized_obs = _rnd_normalize_obs(state, obs, pixels)
+    normalized_obs = _rnd_normalize_obs(state, obs, pixels, mode)
     target = target_network.apply(
         {"params": state.rnd_target_params}, normalized_obs
     )
@@ -510,19 +562,29 @@ def train(args=None, rnd=None, environment=None, exploration=None):
     if isinstance(obs_size, Dict):
         raise NotImplementedError("Dictionary observations are not supported")
     action_size = env.action_size
-    pixel_rnd = bool(getattr(args.env, "pixel_obs", False))
+    # ``rnd.input`` selects the space the novelty model is defined over.
+    # Older configs only had the implicit "pixels if e_pixel_obs else state"
+    # rule, so fall back to it when the field is absent.
+    rnd_input_mode = getattr(
+        rnd, "input", "pixels" if getattr(args.env, "pixel_obs", False) else "state"
+    )
+    if rnd_input_mode not in RND_INPUTS:
+        raise ValueError(f"unknown r_input {rnd_input_mode!r}; choose one of {RND_INPUTS}")
+    pixel_rnd = rnd_input_mode == "pixels"
+    # PixelAntMaze frames are also consumed by SAC_NEO's pixel Laplacian, so
+    # they are rendered/threaded whenever the wrapper is present, independently
+    # of whether RND itself is defined over pixels.
+    pixels_available = bool(getattr(args.env, "pixel_obs", False))
     if pixel_rnd:
+        if not getattr(args.env, "pixel_obs", False):
+            raise ValueError("r_input=pixels requires --e_pixel_obs True")
         if args.env.pixel_size < 36:
             raise ValueError(
                 "e_pixel_size must be at least 36 for the SAC_RND convolutional encoder"
             )
-        rnd_obs_shape = (args.env.pixel_size, args.env.pixel_size, 3)
-    else:
-        if obs_size <= _ANTMAZE_GOAL_DIMS:
-            raise ValueError(
-                "AntMaze observation must contain state plus two goal coordinates"
-            )
-        rnd_obs_shape = (obs_size - _ANTMAZE_GOAL_DIMS,)
+    rnd_obs_shape = rnd_input_shape(
+        rnd_input_mode, obs_size, getattr(args.env, "pixel_size", 0)
+    )
 
     normalize_fn = lambda observation, _: observation
     if args.env.normalize_obs:
@@ -560,6 +622,7 @@ def train(args=None, rnd=None, environment=None, exploration=None):
             action_size=action_size,
             target_network=target_network,
             predictor_network=predictor_network,
+            rnd_input=rnd_input_mode,
         )
 
     exploration_replay_spec = {}
@@ -664,10 +727,13 @@ def train(args=None, rnd=None, environment=None, exploration=None):
             intrinsic_reward
             + rnd.int_gamma * jnp.min(next_q_int, axis=-1)
         )
-        ext_error = q_ext - jnp.expand_dims(ext_target, -1)
         truncation = transitions.extras["state_extras"]["truncation"]
-        ext_error *= jnp.expand_dims(1.0 - truncation, -1)
-        int_error = q_int - jnp.expand_dims(int_target, -1)
+        not_truncated = jnp.expand_dims(1.0 - truncation, -1)
+        ext_error = (q_ext - jnp.expand_dims(ext_target, -1)) * not_truncated
+        # A time-limit truncation is not a real bootstrap target for either
+        # head, so drop it from the intrinsic critic as well rather than only
+        # from the extrinsic one.
+        int_error = (q_int - jnp.expand_dims(int_target, -1)) * not_truncated
         ext_td = 0.5 * jnp.mean(jnp.square(ext_error))
         int_td = 0.5 * jnp.mean(jnp.square(int_error))
         return ext_td + rnd.int_coef * int_td, (
@@ -853,7 +919,7 @@ def train(args=None, rnd=None, environment=None, exploration=None):
             )
             return jnp.where(done > 0, reset_pixels, pixels)
 
-        previous_pixels = autoreset_pixels(env_state) if pixel_rnd else None
+        previous_pixels = autoreset_pixels(env_state) if pixels_available else None
         if exploration is None:
             env_state, transitions = acting.actor_step(
                 env, env_state, policy, key, extra_fields=("truncation",)
@@ -889,9 +955,9 @@ def train(args=None, rnd=None, environment=None, exploration=None):
             )
             state = state.replace(exploration_state=exploration_state)
 
-        next_pixels = autoreset_pixels(env_state) if pixel_rnd else None
+        next_pixels = autoreset_pixels(env_state) if pixels_available else None
         rnd_next_observation = _rnd_input(
-            transitions.next_observation, next_pixels
+            transitions.next_observation, next_pixels, rnd_input_mode
         )
         raw_intrinsic = _rnd_intrinsic_reward(
             state,
@@ -899,6 +965,7 @@ def train(args=None, rnd=None, environment=None, exploration=None):
             predictor_network,
             transitions.next_observation,
             next_pixels,
+            rnd_input_mode,
         )
         next_env_steps = state.env_steps + env_steps_per_actor_step
         burnin = next_env_steps < rnd.obs_burnin
@@ -960,7 +1027,7 @@ def train(args=None, rnd=None, environment=None, exploration=None):
         # update.  Attach them after replay insertion; exploration modules may
         # separately store a compact representation through replay_extras.
         fresh_transition = transitions
-        if pixel_rnd:
+        if pixels_available:
             fresh_transition = transitions._replace(
                 extras={
                     **transitions.extras,
@@ -1129,13 +1196,13 @@ def train(args=None, rnd=None, environment=None, exploration=None):
     env_keys = jax.random.split(env_key, args.env.n_envs // jax.process_count())
     env_keys = jnp.reshape(env_keys, (local_devices_to_use, -1) + env_keys.shape[1:])
     env_state = jax.pmap(env.reset)(env_keys)
-    if pixel_rnd:
+    if pixels_available:
         missing = {
             key for key in ("pixels", "_pixels_reset") if key not in env_state.info
         }
         if missing:
             raise RuntimeError(
-                "Pixel RND was requested, but the wrapped environment reset "
+                "Pixel observations were requested, but the wrapped environment reset "
                 f"did not produce state.info keys {sorted(missing)}. Ensure "
                 "PixelAntMazeWrapper is imported from the same package as "
                 "this SAC_RND trainer."

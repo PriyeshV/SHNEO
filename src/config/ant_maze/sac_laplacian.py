@@ -85,6 +85,10 @@ class SACRNDConfig:
     dims: Tuple[int, ...]
     feat_dim: int
     max_grad_norm: float
+    # Which observation space the novelty model sees: the goal-free ant state
+    # ("state"), the torso x/y position ("xy"), or a PixelAntMaze frame
+    # ("pixels").  See ``--r_input`` for why this matters on AntMaze.
+    input: str
 
 
 @dataclass(frozen=True)
@@ -298,8 +302,27 @@ def build_parser(profile: str = "sac_neo") -> argparse.ArgumentParser:
     # RND.
     parser.add_argument("--a_int_coef", type=float, default=1.0 if profile == "sac_rnd" else 0.0)
     parser.add_argument("--r_int_gamma", type=float, default=0.99)
-    parser.add_argument("--r_obs_burnin", type=int, default=500_000)
+    # The burn-in only collects observation statistics before the predictor
+    # starts training; it does not need a large fraction of the run.  The
+    # PQN default of 500k assumes a 25M-step Atari budget *and* 4096
+    # transitions per rollout.  Here one vectorized actor step already yields
+    # e_n_envs transitions, so 500k env steps freezes the novelty signal --
+    # and therefore the whole NEO Laplacian weighting -- for the first 5% of
+    # training.  Match the replay prefill instead.
+    parser.add_argument("--r_obs_burnin", type=int, default=10_000)
     parser.add_argument("--r_upd_prop", type=float, default=0.25)
+    # Observation space seen by the RND target/predictor.
+    #   state  - goal-free ant state (31 - 2 = 29 dims on JaxGCRL AntMaze).
+    #   xy     - torso x/y only.  On AntMaze the full state is dominated by
+    #            joint angles and velocities, which stay novel forever, so
+    #            "state" novelty says almost nothing about *where* the ant has
+    #            been.  NEO's reliability weighting needs positional novelty.
+    #   pixels - PixelAntMaze frame; requires --e_pixel_obs True.
+    #   auto   - "pixels" when --e_pixel_obs True, otherwise "state" (the
+    #            historical behaviour of this file).
+    parser.add_argument(
+        "--r_input", choices=("auto", "state", "xy", "pixels"), default="auto"
+    )
     parser.add_argument("--r_update_interval", type=_positive_int, default=16 if profile == "sac_neo" else 1)
     parser.add_argument("--r_lr", type=float, default=1e-4)
     parser.add_argument("--r_dims", type=int, nargs="+", default=[256, 256])
@@ -312,7 +335,13 @@ def build_parser(profile: str = "sac_neo") -> argparse.ArgumentParser:
     parser.add_argument("--lap_dims", type=_positive_int, default=32)
     parser.add_argument("--lap_hidden_dims", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--lap_pixel_size", type=_positive_int, default=21)
-    parser.add_argument("--lap_update_interval", type=_positive_int, default=None)
+    # One vectorized actor step provides a single fresh transition per env, so
+    # the Laplacian batch is e_n_envs.  Tying this to r_update_interval (16)
+    # left roughly a_tot_steps / (e_n_envs * 16) ~= 4.9k Laplacian gradient
+    # steps for a 10M-step run, which is far too few to resolve lap_dims
+    # eigenfunctions.  Default to every actor step; pass an explicit value to
+    # restore the sparse schedule.
+    parser.add_argument("--lap_update_interval", type=_positive_int, default=1)
     parser.add_argument("--lap_max_grad_norm", type=float, default=10.0)
     parser.add_argument("--lap_batch_norm", type=str2bool, default=False)
     parser.add_argument("--lap_layer_norm", type=str2bool, default=False)
@@ -351,7 +380,13 @@ def build_parser(profile: str = "sac_neo") -> argparse.ArgumentParser:
 
 def parse_args(profile: str = "sac_neo") -> Config:
     raw = build_parser(profile).parse_args()
-    lap_update_interval = raw.r_update_interval if raw.lap_update_interval is None else raw.lap_update_interval
+    lap_update_interval = raw.lap_update_interval
+
+    rnd_input = raw.r_input
+    if rnd_input == "auto":
+        rnd_input = "pixels" if raw.e_pixel_obs else "state"
+    if rnd_input == "pixels" and not raw.e_pixel_obs:
+        raise ValueError("r_input=pixels requires --e_pixel_obs True")
 
     if not 0.0 < raw.e_gamma <= 1.0:
         raise ValueError("e_gamma must be in (0, 1]")
@@ -436,7 +471,7 @@ def parse_args(profile: str = "sac_neo") -> Config:
             obs_burnin=raw.r_obs_burnin, upd_prop=raw.r_upd_prop,
             update_interval=raw.r_update_interval, lr=raw.r_lr,
             dims=tuple(raw.r_dims), feat_dim=raw.r_feat_dim,
-            max_grad_norm=raw.r_max_grad_norm,
+            max_grad_norm=raw.r_max_grad_norm, input=rnd_input,
         ),
         laplacian=SACLaplacianConfig(
             lr=raw.lap_lr, dims=raw.lap_dims,
