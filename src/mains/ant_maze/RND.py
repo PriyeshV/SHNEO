@@ -345,6 +345,30 @@ def _unpmap(value):
     return jax.tree_util.tree_map(lambda x: x[0], value)
 
 
+def _replicate_to_devices(value, devices):
+    """Adds a leading device axis to every leaf, for ``jax.pmap``.
+
+    ``jax.device_put_replicated`` was deprecated in jax 0.8.1 and removed in
+    0.10.0.  Prefer it while it exists so behaviour is unchanged on the jax
+    versions this project was developed against, and otherwise use the drop-in
+    from jax's pmap migration guide.  ``jax.pmap`` itself is only in
+    maintenance mode, so the surrounding structure stays as it is.
+    """
+
+    legacy = getattr(jax, "device_put_replicated", None)
+    if legacy is not None:
+        return legacy(value, devices)
+
+    mesh = jax.sharding.Mesh(np.array(devices), ("x",))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("x"))
+    return jax.tree_util.tree_map(
+        lambda leaf: jax.device_put(
+            jnp.stack([leaf] * len(devices)), sharding
+        ),
+        value,
+    )
+
+
 def _rnd_observation(obs: jax.Array) -> jax.Array:
     """Remove JaxGCRL AntMaze's final ``target_x, target_y`` entries."""
 
@@ -498,7 +522,7 @@ def _init_training_state(
         env_steps=jnp.zeros((), dtype=jnp.int32),
         exploration_state=exploration_state,
     )
-    return jax.device_put_replicated(
+    return _replicate_to_devices(
         state, jax.local_devices()[:local_devices_to_use]
     )
 
