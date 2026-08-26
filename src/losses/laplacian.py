@@ -354,7 +354,8 @@ def update_duals(error_matrix, betas, dual_lr=1e-4, a_min=-500, a_max=0, clip_va
         updates = jnp.clip(updates, -clip_value, clip_value)
 
     updated_duals = betas + dual_lr * updates
-    updated_duals = jnp.clip(updated_duals, a_min=a_min, a_max=a_max)
+    # Positional (min, max): jax removed the a_min/a_max keywords in 0.4.30.
+    updated_duals = jnp.clip(updated_duals, a_min, a_max)
     return jnp.tril(updated_duals)
 
 
