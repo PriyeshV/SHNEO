@@ -32,7 +32,11 @@
 #SBATCH --time=05:00:00
 #SBATCH --requeue
 #SBATCH --array=0-15
-#SBATCH --output=/home/mila/%u/slurm-%A_%a.out
+# Relative to the submission directory (the repo), which .gitignore already
+# excludes.  An absolute path built from %u is wrong on Mila, where homes are
+# /home/mila/<first-letter>/<user>/ and %u expands to the username alone --
+# SLURM then cannot open the file and fails every task before it starts.
+#SBATCH --output=slurm-%A_%a.out
 
 set -euo pipefail
 
