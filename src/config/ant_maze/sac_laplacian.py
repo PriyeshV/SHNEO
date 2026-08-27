@@ -235,6 +235,13 @@ class Config:
     def eps_frac(self): return self.sac.eps.frac
 
 
+# Smallest square frame the shared RND / pixel-Laplacian encoder accepts.
+# The stack is VALID-padded 8x8 stride 4, 4x4 stride 2, 3x3 stride 1, so the
+# spatial size goes 36 -> 8 -> 3 -> 1.  Anything smaller drives the third
+# layer to a non-positive width and flax then builds a zero-input Dense.
+_MIN_CONV_INPUT = 36
+
+
 def _positive_int(value: str) -> int:
     parsed = int(float(value))
     if parsed <= 0:
@@ -334,7 +341,13 @@ def build_parser(profile: str = "sac_neo") -> argparse.ArgumentParser:
     parser.add_argument("--lap_lr", type=float, default=2.5e-4)
     parser.add_argument("--lap_dims", type=_positive_int, default=32)
     parser.add_argument("--lap_hidden_dims", type=int, nargs="+", default=[256, 256])
-    parser.add_argument("--lap_pixel_size", type=_positive_int, default=21)
+    # PixelLaplacianEncoder runs the same VALID-padded 8x8/4, 4x4/2, 3x3/1
+    # stack as the RND encoders, which cannot consume anything below 36 (see
+    # _MIN_CONV_INPUT).  The previous default of 21 collapsed the third
+    # convolution to a zero-width feature map, so the pixel Laplacian could
+    # never initialize.  48 keeps the frame cheap while leaving a 2x2x64
+    # feature map rather than the single spatial cell that 36 produces.
+    parser.add_argument("--lap_pixel_size", type=_positive_int, default=48)
     # One vectorized actor step provides a single fresh transition per env, so
     # the Laplacian batch is e_n_envs.  Tying this to r_update_interval (16)
     # left roughly a_tot_steps / (e_n_envs * 16) ~= 4.9k Laplacian gradient
@@ -401,10 +414,16 @@ def parse_args(profile: str = "sac_neo") -> Config:
         raise ValueError("all network dimensions must be positive")
     if raw.lap_dims < raw.o_n_options:
         raise ValueError("lap_dims must be at least o_n_options")
-    if raw.e_pixel_obs and raw.e_pixel_size < 36:
-        raise ValueError("pixel RND requires e_pixel_size >= 36")
-    if raw.lap_pixel_size < 16:
-        raise ValueError("lap_pixel_size must be at least 16")
+    if raw.e_pixel_obs and raw.e_pixel_size < _MIN_CONV_INPUT:
+        raise ValueError(
+            f"pixel RND requires e_pixel_size >= {_MIN_CONV_INPUT}"
+        )
+    if raw.lap_pixel_size < _MIN_CONV_INPUT:
+        raise ValueError(
+            f"lap_pixel_size must be at least {_MIN_CONV_INPUT}: the pixel "
+            "Laplacian shares the RND convolutional stack, whose third layer "
+            "produces an empty feature map on smaller frames"
+        )
     if raw.lap_batch_norm or raw.lap_layer_norm:
         raise NotImplementedError(
             "The current SAC Laplacian encoders do not maintain Flax "
