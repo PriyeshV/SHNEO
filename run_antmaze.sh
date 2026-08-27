@@ -2,36 +2,30 @@
 # SLURM array for the AntMaze continuous case (Mila).
 #
 #   sbatch run_antmaze.sh
+#   python src/mains/ant_maze/summarize_runs.py
 #
-# Four arms on ant_u_maze, 16 tasks:
+# Three arms x 12 seeds on ant_u_maze.
 #
-#   SAC_rep   x4   SAC baseline, seed 0 every time.  A reproducibility probe:
-#                  identical command, identical seed.  Their spread is the
-#                  real run-to-run noise floor, which every arm comparison
-#                  has to clear before it means anything.  Two earlier grids
-#                  gave this same configuration AUC 0.274 and 0.139.
-#   SAC       x4   seeds 0-3, the baseline proper.
-#   NEO_e010  x4   seeds 0-3, eigen-options at a 10% epsilon floor.
-#   NEO_e030  x4   seeds 0-3, 30% floor.
+# Twelve rather than three or four because success-rate AUC here is bimodal:
+# a run either reaches ~0.26 or stalls at ~0.14, with a wide empty gap between.
+# A reproducibility probe -- four runs of one command at one seed -- spanned
+# 0.140 to 0.274, as wide as the spread across different seeds.  So the seed
+# explains almost none of the variance, small samples look precise whenever
+# they land in one mode, and the statistic worth reporting is the fraction of
+# runs reaching the upper mode rather than a mean.  Separating 100% from 60%
+# needs roughly a dozen runs per arm.
 #
-# The inherited floor of 0.01 leaves options generating 1% of transitions once
-# the schedule decays, i.e. NEO is SAC for 90% of training.  Higher floors keep
-# them in the behaviour mix.
-#
-# a_n_evals is 40 rather than 20: the trapezoidal AUC is computed over the
-# evaluation points, so doubling them halves its discretization.
-#
-# Checkpoints land in ckpt/<tag>_seed<N>/ so the learned eigenfunctions survive
-# the job for src/mains/ant_maze/plot_eigenfunctions.py.
+# Checkpoints are written only for seed 0 of each arm; 40 evaluations x 36 runs
+# of full checkpoints would be several GB for no extra insight.
 
-#SBATCH --job-name=shneo_repro
+#SBATCH --job-name=shneo_modes
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100l:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=05:00:00
 #SBATCH --requeue
-#SBATCH --array=0-15
+#SBATCH --array=0-35
 # Relative to the submission directory (the repo), which .gitignore already
 # excludes.  An absolute path built from %u is wrong on Mila, where homes are
 # /home/mila/<first-letter>/<user>/ and %u expands to the username alone --
@@ -45,16 +39,12 @@ REPO="${SHNEO_REPO:-$HOME/SHNEO}"
 source "$VENV/bin/activate"
 cd "$REPO"
 
-#            0        1        2        3       4   5   6   7
-TAGS=(   SAC_rep  SAC_rep  SAC_rep  SAC_rep   SAC SAC SAC SAC \
-         NEO_e010 NEO_e010 NEO_e010 NEO_e010  NEO_e030 NEO_e030 NEO_e030 NEO_e030 )
-SEEDS=(     0        0        0        0       0   1   2   3 \
-            0        1        2        3       0   1   2   3 )
+SEEDS_PER_ARM=12
+ARMS=(SAC NEO_e010 NEO_e030)
 
-TAG="${TAGS[$SLURM_ARRAY_TASK_ID]}"
-SEED="${SEEDS[$SLURM_ARRAY_TASK_ID]}"
-CKPT="$REPO/ckpt/${TAG}_seed${SEED}_t${SLURM_ARRAY_TASK_ID}"
-mkdir -p "$CKPT"
+ARM_INDEX=$(( SLURM_ARRAY_TASK_ID / SEEDS_PER_ARM ))
+SEED=$(( SLURM_ARRAY_TASK_ID % SEEDS_PER_ARM ))
+TAG="${ARMS[$ARM_INDEX]}"
 
 COMMON=(
   --e_id ant_u_maze
@@ -63,16 +53,21 @@ COMMON=(
   --wb_on True
   --e_n_test_envs 64
   --a_n_evals 40
-  --a_checkpoint_logdir "$CKPT"
   --x_seed "$SEED"
   --x_file "$TAG"
   --wb_model "$TAG"
 )
 
+if [ "$SEED" -eq 0 ]; then
+  CKPT="$REPO/ckpt/${TAG}_seed0"
+  mkdir -p "$CKPT"
+  COMMON+=(--a_checkpoint_logdir "$CKPT")
+fi
+
 case "$TAG" in
-  SAC|SAC_rep) SCRIPT=src/mains/ant_maze/RND.py;       EXTRA=(--a_int_coef 0) ;;
-  NEO_e010)    SCRIPT=src/mains/ant_maze/NEO_LapXY.py; EXTRA=(--a_eps_end 0.10) ;;
-  NEO_e030)    SCRIPT=src/mains/ant_maze/NEO_LapXY.py; EXTRA=(--a_eps_end 0.30) ;;
+  SAC)      SCRIPT=src/mains/ant_maze/RND.py;       EXTRA=(--a_int_coef 0) ;;
+  NEO_e010) SCRIPT=src/mains/ant_maze/NEO_LapXY.py; EXTRA=(--a_eps_end 0.10) ;;
+  NEO_e030) SCRIPT=src/mains/ant_maze/NEO_LapXY.py; EXTRA=(--a_eps_end 0.30) ;;
   *) echo "unexpected tag $TAG" >&2; exit 1 ;;
 esac
 
