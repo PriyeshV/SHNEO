@@ -541,7 +541,20 @@ class SNEOExplorer:
         zeta = jnp.clip(raw_zeta * scale, 0.0, self.config.neo_delta)
         return novelty_n, inv, zeta, max_inv, scale
 
-    def fresh_update(self, extra, train_state, transitions, key):
+    def checkpoint_params(self, extra):
+        """Parameters worth keeping for post-hoc analysis of a NEO run."""
+
+        return {
+            "lap_params": extra.lap_params,
+            "option_policy_params": extra.option_policy_params,
+            "eigenvalues": extra.eigenvalues,
+        }
+
+    def fresh_update(self, extra, train_state, transitions, key, replay=None):
+        # ``replay`` is ignored on purpose: this Laplacian consumes rendered
+        # frames, which are deliberately not stored in the replay buffer, so
+        # it can only train on the freshly collected pixel pairs.
+        del replay
         rnd_pixels = transitions.extras.get("rnd_pixels")
         pixels0 = None if rnd_pixels is None else rnd_pixels["observation"]
         pixels1 = None if rnd_pixels is None else rnd_pixels["next_observation"]

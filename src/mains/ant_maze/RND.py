@@ -1084,6 +1084,19 @@ def train(args=None, rnd=None, environment=None, exploration=None):
             behavior_metrics,
             fresh_transition,
         ) = get_experience(state, env_state, buffer_state, experience_key)
+        # Replay is sampled before the exploration update so a module whose
+        # auxiliary model lives in the stored observation space (the vector
+        # Laplacian) can train on a decorrelated replay batch rather than the
+        # e_n_envs correlated transitions collected this step.  Modules that
+        # need data absent from replay, such as the pixel Laplacian, ignore
+        # the ``replay`` argument and keep using ``fresh_transition``.
+        buffer_state, replay_transitions = replay_buffer.sample(buffer_state)
+        transitions = jax.tree_util.tree_map(
+            lambda x: jnp.reshape(
+                x, (args.algo.grad_updates_per_step, -1) + x.shape[1:]
+            ),
+            replay_transitions,
+        )
         fresh_metrics = {}
         if exploration is not None:
             exploration_state, fresh_metrics = exploration.fresh_update(
@@ -1091,17 +1104,11 @@ def train(args=None, rnd=None, environment=None, exploration=None):
                 state,
                 transitions=fresh_transition,
                 key=fresh_key,
+                replay=replay_transitions,
             )
             state = state.replace(exploration_state=exploration_state)
         state, rnd_loss, rnd_updated = update_predictor_once(
             state, fresh_next_observation, predictor_key
-        )
-        buffer_state, transitions = replay_buffer.sample(buffer_state)
-        transitions = jax.tree_util.tree_map(
-            lambda x: jnp.reshape(
-                x, (args.algo.grad_updates_per_step, -1) + x.shape[1:]
-            ),
-            transitions,
         )
         (state, _), metrics = jax.lax.scan(
             sgd_step, (state, training_key), transitions
@@ -1307,12 +1314,29 @@ def train(args=None, rnd=None, environment=None, exploration=None):
             if args.algo.checkpoint_logdir:
                 params = _unpmap((state.normalizer_params, state.policy_params))
                 os.makedirs(args.algo.checkpoint_logdir, exist_ok=True)
+                prefix = "sac_neo" if exploration is not None else "sac_rnd"
                 path = os.path.join(
                     args.algo.checkpoint_logdir,
-                    f"{'sac_neo' if exploration is not None else 'sac_rnd'}_"
-                    f"{current_step}.pkl",
+                    f"{prefix}_{current_step}.pkl",
                 )
                 model.save_params(path, params)
+                # An exploration module's own parameters are not part of the
+                # inference interface, but they are what makes a NEO run
+                # interpretable afterwards: without the Laplacian weights the
+                # learned eigenfunctions cannot be inspected once the job ends.
+                if exploration is not None and hasattr(
+                    exploration, "checkpoint_params"
+                ):
+                    explore_params = exploration.checkpoint_params(
+                        _unpmap(state.exploration_state)
+                    )
+                    model.save_params(
+                        os.path.join(
+                            args.algo.checkpoint_logdir,
+                            f"{prefix}_explore_{current_step}.pkl",
+                        ),
+                        explore_params,
+                    )
             metrics = evaluator.run_evaluation(
                 _unpmap((state.normalizer_params, state.policy_params)),
                 training_metrics,

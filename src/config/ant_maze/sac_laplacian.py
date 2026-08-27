@@ -383,7 +383,12 @@ def build_parser(profile: str = "sac_neo") -> argparse.ArgumentParser:
     parser.add_argument("--neo_k", type=float, default=1.0)
     parser.add_argument("--neo_delta", type=float, default=0.5)
     parser.add_argument("--neo_targ_mean", type=float, default=0.3)
-    parser.add_argument("--neo_rnd_coef", type=float, default=1.0)
+    # Weight of the RND novelty term in the *option* reward.  Both reference
+    # agents use 0.0 (`add_common_neo_args`, and DQN_SNEO's --sneo_rnd_beta).
+    # The novelty reward is broadcast identically to every option, so a
+    # non-zero weight pushes all of them toward one shared novelty-seeking
+    # behaviour -- the opposite of what per-eigenfunction options are for.
+    parser.add_argument("--neo_rnd_coef", type=float, default=0.0)
     parser.add_argument("--neo_lap_wt", type=str2bool, default=True)
     parser.add_argument("--neo_ema_tau", type=float, default=1e-3)
     parser.add_argument("--neo_bonus_q", type=float, default=0.99)

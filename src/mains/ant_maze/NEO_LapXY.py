@@ -11,9 +11,14 @@ This is the continuous-action counterpart of ``PQN_NEO.py``/``DQN_SNEO.py``:
 The existing Brax uniform replay stores independent transitions, so the source
 Laplacian update is intentionally one-step.  Treating unrelated replay samples
 as an n-step trajectory would silently implement the wrong graph objective.
-RND and the XY Laplacian use the shared auxiliary-update interval (16
-vectorized actor steps by default for NEO), independently of SAC replay's
-gradient-updates-per-step setting.
+
+Because the Laplacian here consumes torso ``(x, y)`` -- which replay already
+stores -- it trains on a replay batch rather than only the transitions
+collected this step.  A ``lap_dims``-dimensional embedding needs many more
+samples than ``e_n_envs`` for its Gram matrix to be estimable, which is what
+both reference agents give it.  The novelty and zeta calibration EMAs still
+advance from the online transitions, so the reliability weighting continues to
+describe what the agent is currently seeing.
 """
 
 import os
@@ -468,7 +473,35 @@ class SNEOExplorer:
         zeta = jnp.clip(raw_zeta * scale, 0.0, self.config.neo_delta)
         return novelty_n, inv, zeta, max_inv, scale
 
-    def fresh_update(self, extra, train_state, transitions, key):
+    def _zeta_at(self, extra, novelty):
+        """zeta for an arbitrary batch, holding the calibration EMAs fixed.
+
+        ``_zeta`` advances ``max_inv_ema`` and ``mean_scale_ema``, which must
+        track the *online* novelty distribution.  Scoring a replay batch must
+        not disturb that, so this reproduces the same mapping using whatever
+        calibration ``extra`` currently carries.
+        """
+
+        novelty_n = jnp.clip(
+            novelty / (extra.rnd_bonus_max_ema + 1e-8), 0.0, 1.0
+        )
+        inv = jnp.minimum(1.0 / (novelty_n + 1e-6), self.config.neo_inv_cap)
+        x = jnp.clip(inv / jnp.maximum(extra.max_inv_ema, 1e-8), 0.0, 1.0)
+        raw_zeta = self.config.neo_delta * jnp.power(x, 1.0 / self.config.neo_k)
+        return jnp.clip(
+            raw_zeta * extra.mean_scale_ema, 0.0, self.config.neo_delta
+        )
+
+    def checkpoint_params(self, extra):
+        """Parameters worth keeping for post-hoc analysis of a NEO run."""
+
+        return {
+            "lap_params": extra.lap_params,
+            "option_policy_params": extra.option_policy_params,
+            "eigenvalues": extra.eigenvalues,
+        }
+
+    def fresh_update(self, extra, train_state, transitions, key, replay=None):
         rnd_pixels = transitions.extras.get("rnd_pixels")
         pixels0 = None if rnd_pixels is None else rnd_pixels["observation"]
         pixels1 = None if rnd_pixels is None else rnd_pixels["next_observation"]
@@ -487,11 +520,31 @@ class SNEOExplorer:
         )
         extra = extra.replace(rnd_bonus_max_ema=bonus_max)
         novelty_n, inv, zeta, max_inv, scale = self._zeta(extra, all_novelty)
-        batch = novelty0.shape[0]
-        zeta0, zeta1 = zeta[:batch], zeta[batch:]
+        # Apply the advanced calibration now so the replay batch below is
+        # scored with the same EMAs the online statistics just produced.
+        extra = extra.replace(max_inv_ema=max_inv, mean_scale_ema=scale)
 
-        xy0 = self._lap_obs(transitions.observation)
-        xy1 = self._lap_obs(transitions.next_observation)
+        # The Laplacian consumes torso xy, which replay already stores, so it
+        # trains on a decorrelated replay batch instead of the e_n_envs
+        # correlated transitions from this step.  A 32-dimensional embedding
+        # needs far more than e_n_envs samples for its Gram matrix to be
+        # estimable, which is what both reference agents give it.
+        lap_src = transitions if replay is None else replay
+        if replay is None:
+            lap_novelty1 = novelty1
+            lap_zeta0, lap_zeta1 = zeta[: novelty0.shape[0]], zeta[novelty0.shape[0] :]
+        else:
+            lap_novelty0 = self._normalized_novelty(
+                train_state, replay.observation
+            )
+            lap_novelty1 = self._normalized_novelty(
+                train_state, replay.next_observation
+            )
+            lap_zeta0 = self._zeta_at(extra, lap_novelty0)
+            lap_zeta1 = self._zeta_at(extra, lap_novelty1)
+
+        xy0 = self._lap_obs(lap_src.observation)
+        xy1 = self._lap_obs(lap_src.next_observation)
         # Brax's AutoResetWrapper overwrites next_observation with the
         # episode's *initial* observation whenever done, so a done transition
         # is not a graph edge: keeping it would wire every terminal state to
@@ -499,8 +552,8 @@ class SNEOExplorer:
         # as on the time limit, so this is not a rare event early in training
         # and ``1 - truncation`` misses all of it.  ``discount`` is
         # ``1 - done`` and covers both cases.
-        edge_valid = transitions.discount
-        lap_novelty = self._lap_novelty(train_state, novelty1)
+        edge_valid = lap_src.discount
+        lap_novelty = self._lap_novelty(train_state, lap_novelty1)
 
         def lap_loss(params):
             phi0 = self.lap_network.apply({"params": params}, xy0)
@@ -517,7 +570,7 @@ class SNEOExplorer:
                 betas=extra.betas,
                 weights=None,
                 novelty_values=lap_novelty[:, None],
-                zeta_values=jnp.stack([zeta0, zeta1], axis=1),
+                zeta_values=jnp.stack([lap_zeta0, lap_zeta1], axis=1),
                 use_novelty=self.config.lap_novel_weight,
                 use_zeta=True,
                 normalize_zeta=False,
