@@ -69,6 +69,29 @@ def _is_wall(points, wall, scale):
     return wall[i, j]
 
 
+def ascii_sign_maps(phi, wall_grid, n_show, rows, cols):
+    """Print each eigenfunction's sign structure as text.
+
+    The nodal line -- where phi changes sign -- is what matters for an
+    eigen-option: a genuine maze Laplacian puts it across a corridor, so the
+    two signs are regions the agent must travel between.  A function that
+    ignores the walls is only a smooth function of position.
+    """
+
+    for m in range(n_show):
+        field = phi[:, m].reshape(rows, cols)
+        free = ~wall_grid
+        positive = int(np.sum((field > 0) & free))
+        total = int(np.sum(free))
+        print(f"\nphi_{m}   positive over {positive / total:5.1%} of free space")
+        for r in range(rows):
+            line = "".join(
+                "#" if wall_grid[r, c] else ("+" if field[r, c] > 0 else "-")
+                for c in range(cols)
+            )
+            print("  " + line)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True,
@@ -78,6 +101,8 @@ def main() -> None:
     parser.add_argument("--n_show", type=int, default=5, help="eigenfunctions to draw")
     parser.add_argument("--resolution", type=int, default=220)
     parser.add_argument("--out", default="eigenfunctions.png")
+    parser.add_argument("--ascii", action="store_true",
+                        help="also print sign maps as text, no transfer needed")
     args = parser.parse_args()
 
     # A directory is accepted so callers need not know the final step number,
@@ -165,6 +190,18 @@ def main() -> None:
     print("per-eigenfunction std over the maze:", np.array2string(spread, precision=3))
     if np.all(spread < 1e-2):
         print("WARNING: all eigenfunctions are near-constant; the Laplacian did not converge")
+
+    if args.ascii:
+        # Character cells are about twice as tall as wide, so use twice as
+        # many columns to keep the maze square on screen.
+        rows, cols = 21, 42
+        axis_x = np.linspace(extent[1], extent[0], rows, dtype=np.float32)
+        axis_y = np.linspace(extent[2], extent[3], cols, dtype=np.float32)
+        cx, cy = np.meshgrid(axis_x, axis_y, indexing="ij")
+        coarse = np.stack([cx.ravel(), cy.ravel()], axis=-1)
+        coarse_phi = np.array(jax.jit(apply)(jnp.asarray(coarse)))
+        coarse_wall = _is_wall(coarse, wall, args.scale).reshape(rows, cols)
+        ascii_sign_maps(coarse_phi, coarse_wall, n_show, rows, cols)
 
 
 if __name__ == "__main__":
