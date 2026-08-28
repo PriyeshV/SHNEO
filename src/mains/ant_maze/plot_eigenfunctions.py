@@ -107,8 +107,7 @@ def cell_magnitudes(phi, points, wall, scale, n_show):
     magnitude = np.abs(phi)
 
     for m in range(n_show):
-        print(f"
-mean |phi_{m}| per maze cell (large x on top)")
+        print(f"\nmean |phi_{m}| per maze cell (large x on top)")
         for r in range(rows - 1, -1, -1):
             cells = []
             for c in range(columns):
