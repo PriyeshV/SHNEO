@@ -35,7 +35,7 @@ import matplotlib  # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
-from flax.serialization import msgpack_restore  # noqa: E402
+from brax.io import model  # noqa: E402
 
 from src.mains.ant_maze.pixel_ant_maze import ANT_MAZE_LAYOUTS  # noqa: E402
 
@@ -91,8 +91,9 @@ def main() -> None:
             re.search(r"(\d+)\.pkl$", os.path.basename(p)).group(1)))
         print(f"using {os.path.basename(checkpoint)}")
 
-    with open(checkpoint, "rb") as handle:
-        payload = msgpack_restore(handle.read())
+    # Read it back the same way the trainer wrote it: brax.io.model uses
+    # pickle, so a flax msgpack reader sees trailing bytes and raises.
+    payload = model.load_params(checkpoint)
     if "lap_params" not in payload:
         raise SystemExit(
             f"{checkpoint} has no 'lap_params'. Point this at the "
