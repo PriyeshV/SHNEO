@@ -26,6 +26,7 @@ from collections import defaultdict
 AUC_RE = re.compile(r"auc_normalized=([0-9.eE+-]+)")
 TASK_RE = re.compile(r"^task=(\d+)\s+tag=(\S+)\s+seed=(\d+)", re.M)
 SUCCESS_RE = re.compile(r"success=([0-9.]+)")
+CURVE_RE = re.compile(r"env_step=(\d+) \| return=[0-9.eE+-]+ \| success=([0-9.]+)")
 
 
 def newest_job(directory):
@@ -65,6 +66,8 @@ def main() -> None:
     parser.add_argument("--job", default=None, help="array id (default: newest)")
     parser.add_argument("--threshold", type=float, default=None,
                         help="upper-mode boundary (default: widest gap)")
+    parser.add_argument("--curves", action="store_true",
+                        help="compare the mean evaluation curve of each mode")
     args = parser.parse_args()
 
     job = args.job or newest_job(args.dir)
@@ -81,6 +84,7 @@ def main() -> None:
             "task": task, "tag": tag, "seed": seed,
             "auc": float(auc[-1]) if auc else None,
             "final": float(success[-1]) if success else None,
+            "curve": [(int(a), float(b)) for a, b in CURVE_RE.findall(text)],
         })
 
     done = [r for r in runs if r["auc"] is not None]
@@ -119,6 +123,52 @@ def main() -> None:
 
     print("\nOverlapping intervals mean the arms are not separated at this "
           "sample size.")
+
+    if args.curves:
+        _print_curves(done, threshold)
+
+
+def _print_curves(runs, threshold):
+    """Mean evaluation curve for each mode, to locate where runs diverge.
+
+    If the low mode is already behind at the first evaluations, the split is
+    decided early and the cause is in the initial learning dynamics rather
+    than in anything an exploration bonus does later.
+    """
+
+    groups = {"high": [], "low": []}
+    for run in runs:
+        if run["curve"]:
+            groups["high" if run["auc"] >= threshold else "low"].append(run["curve"])
+
+    if not groups["high"] or not groups["low"]:
+        print("\nboth modes need at least one run for the curve comparison")
+        return
+
+    length = min(len(c) for group in groups.values() for c in group)
+    picks = [round(i * (length - 1) / 7.0) for i in range(8)]
+
+    print(f"\nmean success by evaluation ({len(groups['high'])} high, "
+          f"{len(groups['low'])} low)")
+    header = "".join(f"{groups['high'][0][i][0] / 1e6:>9.1f}M" for i in picks)
+    print(f"{'step':<7}{header}")
+    for name in ("high", "low"):
+        cells = ""
+        for i in picks:
+            values = [curve[i][1] for curve in groups[name]]
+            cells += f"{sum(values) / len(values):>10.3f}"
+        print(f"{name:<7}{cells}")
+
+    first = picks[1]
+    high_early = sum(c[first][1] for c in groups["high"]) / len(groups["high"])
+    low_early = sum(c[first][1] for c in groups["low"]) / len(groups["low"])
+    step = groups["high"][0][first][0]
+    if low_early < 0.5 * high_early:
+        print(f"\nThe modes have already separated by {step/1e6:.1f}M steps: "
+              "the split is decided early.")
+    else:
+        print(f"\nThe modes are still together at {step/1e6:.1f}M steps: "
+              "the split happens later in training.")
 
 
 if __name__ == "__main__":
