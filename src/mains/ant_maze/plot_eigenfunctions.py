@@ -92,6 +92,35 @@ def ascii_sign_maps(phi, wall_grid, n_show, rows, cols):
             print("  " + line)
 
 
+def cell_magnitudes(phi, points, wall, scale, n_show):
+    """Mean |phi| per maze cell.
+
+    A sign map cannot tell high-frequency structure from |phi| ~ 0, where the
+    sign is numerical noise.  This does: the eigen-reward is
+    |phi(s')| - |phi(s)|, so any cell whose magnitude is near zero contributes
+    only noise to the option that is defined by that eigenfunction.
+    """
+
+    rows, columns = wall.shape
+    i = np.clip(np.rint(points[:, 0] / scale).astype(int), 0, rows - 1)
+    j = np.clip(np.rint(points[:, 1] / scale).astype(int), 0, columns - 1)
+    magnitude = np.abs(phi)
+
+    for m in range(n_show):
+        print(f"
+mean |phi_{m}| per maze cell (large x on top)")
+        for r in range(rows - 1, -1, -1):
+            cells = []
+            for c in range(columns):
+                if wall[r, c]:
+                    cells.append("    ##")
+                    continue
+                selected = (i == r) & (j == c)
+                value = np.nanmean(magnitude[selected, m]) if selected.any() else np.nan
+                cells.append(f"{value:6.2f}")
+            print("  " + "".join(cells))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True,
@@ -103,6 +132,8 @@ def main() -> None:
     parser.add_argument("--out", default="eigenfunctions.png")
     parser.add_argument("--ascii", action="store_true",
                         help="also print sign maps as text, no transfer needed")
+    parser.add_argument("--cells", action="store_true",
+                        help="print mean |phi| per maze cell")
     args = parser.parse_args()
 
     # A directory is accepted so callers need not know the final step number,
@@ -202,6 +233,9 @@ def main() -> None:
         coarse_phi = np.array(jax.jit(apply)(jnp.asarray(coarse)))
         coarse_wall = _is_wall(coarse, wall, args.scale).reshape(rows, cols)
         ascii_sign_maps(coarse_phi, coarse_wall, n_show, rows, cols)
+
+    if args.cells:
+        cell_magnitudes(phi, points, wall, args.scale, n_show)
 
 
 if __name__ == "__main__":
