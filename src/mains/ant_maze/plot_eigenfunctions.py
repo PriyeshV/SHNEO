@@ -21,7 +21,9 @@ The checkpoint is the ``*_explore_*.pkl`` file written when a NEO run is given
 """
 
 import argparse
+import glob
 import os
+import re
 import sys
 
 sys.path.append(os.getcwd())
@@ -69,7 +71,8 @@ def _is_wall(points, wall, scale):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", required=True, help="*_explore_*.pkl file")
+    parser.add_argument("--checkpoint", required=True,
+                    help="*_explore_*.pkl file, or a checkpoint directory")
     parser.add_argument("--maze", default="u_maze", choices=tuple(ANT_MAZE_LAYOUTS))
     parser.add_argument("--scale", type=float, default=4.0, help="maze_size_scaling")
     parser.add_argument("--n_show", type=int, default=5, help="eigenfunctions to draw")
@@ -77,11 +80,22 @@ def main() -> None:
     parser.add_argument("--out", default="eigenfunctions.png")
     args = parser.parse_args()
 
-    with open(args.checkpoint, "rb") as handle:
+    # A directory is accepted so callers need not know the final step number,
+    # which moves with a_n_evals.
+    checkpoint = args.checkpoint
+    if os.path.isdir(checkpoint):
+        candidates = glob.glob(os.path.join(checkpoint, "*explore*.pkl"))
+        if not candidates:
+            raise SystemExit(f"no *explore*.pkl in {checkpoint!r}")
+        checkpoint = max(candidates, key=lambda p: int(
+            re.search(r"(\d+)\.pkl$", os.path.basename(p)).group(1)))
+        print(f"using {os.path.basename(checkpoint)}")
+
+    with open(checkpoint, "rb") as handle:
         payload = msgpack_restore(handle.read())
     if "lap_params" not in payload:
         raise SystemExit(
-            f"{args.checkpoint} has no 'lap_params'. Point this at the "
+            f"{checkpoint} has no 'lap_params'. Point this at the "
             "*_explore_*.pkl file, not the policy checkpoint."
         )
     lap_params = jax.tree_util.tree_map(jnp.asarray, payload["lap_params"])
@@ -136,7 +150,7 @@ def main() -> None:
 
     fig.suptitle(
         f"Source eigenfunctions over torso xy - {args.maze} - "
-        f"{os.path.basename(args.checkpoint)}",
+        f"{os.path.basename(checkpoint)}",
         fontsize=11,
     )
     fig.savefig(args.out, dpi=150)
