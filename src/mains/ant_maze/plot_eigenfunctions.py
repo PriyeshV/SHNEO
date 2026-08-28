@@ -122,7 +122,9 @@ def main() -> None:
     layout = ANT_MAZE_LAYOUTS[args.maze]
     wall, extent = _wall_mask(layout, args.scale)
     gx, gy, points = _grid(extent, args.resolution)
-    phi = np.asarray(jax.jit(apply)(jnp.asarray(points)))
+    # np.array, not np.asarray: a jax array converts to a read-only view and
+    # the wall masking below writes into it.
+    phi = np.array(jax.jit(apply)(jnp.asarray(points)))
 
     blocked = _is_wall(points, wall, args.scale)
     phi[blocked] = np.nan  # walls are unreachable, so leave them blank
