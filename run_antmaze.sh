@@ -4,21 +4,25 @@
 #   sbatch run_antmaze.sh
 #   python src/mains/ant_maze/summarize_runs.py
 #
-# Three arms x 12 seeds on ant_u_maze.
+# Three arms x 12 seeds on ant_u_maze, each at its own default configuration:
 #
-# Twelve rather than three or four because success-rate AUC here is bimodal:
-# a run either reaches ~0.26 or stalls at ~0.14, with a wide empty gap between.
-# A reproducibility probe -- four runs of one command at one seed -- spanned
-# 0.140 to 0.274, as wide as the spread across different seeds.  So the seed
-# explains almost none of the variance, small samples look precise whenever
-# they land in one mode, and the statistic worth reporting is the fraction of
-# runs reaching the upper mode rather than a mean.  Separating 100% from 60%
-# needs roughly a dozen runs per arm.
+#   SAC_RND    SAC-RND baseline, a_int_coef at the sac_rnd default of 1.0.
+#   NEO_xy     SAC-NEO, vector Laplacian, every NEO knob at its default
+#              (epsilon floor 0.01, neo_rnd_coef 0, lap weighting on).
+#   NEO_pixel  SAC-NEO with the pixel Laplacian, the original formulation.
 #
-# Checkpoints are written only for seed 0 of each arm; 40 evaluations x 36 runs
-# of full checkpoints would be several GB for no extra insight.
+# Together with the SAC, NEO_e010 and NEO_e030 arms already collected, this
+# gives six arms x 12 seeds on one maze.
+#
+# Twelve seeds because success-rate AUC here is bimodal -- a run either
+# reaches ~0.26 or stalls at ~0.14 -- and four runs of one command at one seed
+# spanned 0.140 to 0.274.  The statistic to report is the fraction of runs
+# reaching the upper mode, not a mean over a handful.
+#
+# Checkpoints only for seed 0 of each arm; 40 evaluations x 36 runs of full
+# checkpoints would be several GB for no extra insight.
 
-#SBATCH --job-name=shneo_modes
+#SBATCH --job-name=shneo_report
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100l:1
 #SBATCH --cpus-per-task=4
@@ -28,8 +32,7 @@
 #SBATCH --array=0-35
 # Relative to the submission directory (the repo), which .gitignore already
 # excludes.  An absolute path built from %u is wrong on Mila, where homes are
-# /home/mila/<first-letter>/<user>/ and %u expands to the username alone --
-# SLURM then cannot open the file and fails every task before it starts.
+# /home/mila/<first-letter>/<user>/ and %u expands to the username alone.
 #SBATCH --output=slurm-%A_%a.out
 
 set -euo pipefail
@@ -40,7 +43,7 @@ source "$VENV/bin/activate"
 cd "$REPO"
 
 SEEDS_PER_ARM=12
-ARMS=(SAC NEO_e010 NEO_e030)
+ARMS=(SAC_RND NEO_xy NEO_pixel)
 
 ARM_INDEX=$(( SLURM_ARRAY_TASK_ID / SEEDS_PER_ARM ))
 SEED=$(( SLURM_ARRAY_TASK_ID % SEEDS_PER_ARM ))
@@ -48,8 +51,6 @@ TAG="${ARMS[$ARM_INDEX]}"
 
 COMMON=(
   --e_id ant_u_maze
-  --e_pixel_obs False
-  --r_input xy
   --wb_on True
   --e_n_test_envs 64
   --a_n_evals 40
@@ -65,9 +66,12 @@ if [ "$SEED" -eq 0 ]; then
 fi
 
 case "$TAG" in
-  SAC)      SCRIPT=src/mains/ant_maze/RND.py;       EXTRA=(--a_int_coef 0) ;;
-  NEO_e010) SCRIPT=src/mains/ant_maze/NEO_LapXY.py; EXTRA=(--a_eps_end 0.10) ;;
-  NEO_e030) SCRIPT=src/mains/ant_maze/NEO_LapXY.py; EXTRA=(--a_eps_end 0.30) ;;
+  SAC_RND)   SCRIPT=src/mains/ant_maze/RND.py
+             EXTRA=(--e_pixel_obs False --r_input xy) ;;
+  NEO_xy)    SCRIPT=src/mains/ant_maze/NEO_LapXY.py
+             EXTRA=(--e_pixel_obs False --r_input xy) ;;
+  NEO_pixel) SCRIPT=src/mains/ant_maze/NEO.py
+             EXTRA=(--e_pixel_obs True) ;;
   *) echo "unexpected tag $TAG" >&2; exit 1 ;;
 esac
 
