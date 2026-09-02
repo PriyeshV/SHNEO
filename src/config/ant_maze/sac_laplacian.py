@@ -35,6 +35,7 @@ class BraxEnvConfig:
     action_repeat: int
     normalize_obs: bool
     terminate_on_success: bool
+    dense_reward: bool
     fixed_goal: Optional[Tuple[float, float]]
     pixel_obs: bool
     pixel_size: int
@@ -278,6 +279,11 @@ def build_parser(profile: str = "sac_neo") -> argparse.ArgumentParser:
     parser.add_argument("--e_action_repeat", type=_positive_int, default=1)
     parser.add_argument("--e_normalize_obs", type=str2bool, default=True)
     parser.add_argument("--e_terminate_on_success", type=str2bool, default=True)
+    # AntMaze's sparse reward is exactly `success`, so the agent sees zero
+    # signal until it physically touches the goal.  The dense alternative,
+    # 10*vel_to_target + healthy - ctrl - contact, is a control: if a goal
+    # is unreachable even under dense reward, the problem is not exploration.
+    parser.add_argument("--e_dense_reward", type=str2bool, default=False)
     parser.add_argument("--e_fixed_goal", type=float, nargs=2, metavar=("X", "Y"), default=None)
     parser.add_argument("--e_pixel_obs", type=str2bool, default=False)
     parser.add_argument("--e_pixel_size", type=_positive_int, default=84)
@@ -481,6 +487,7 @@ def parse_args(profile: str = "sac_neo") -> Config:
             action_repeat=raw.e_action_repeat,
             normalize_obs=raw.e_normalize_obs,
             terminate_on_success=raw.e_terminate_on_success,
+            dense_reward=raw.e_dense_reward,
             fixed_goal=tuple(raw.e_fixed_goal) if raw.e_fixed_goal is not None else None,
             pixel_obs=raw.e_pixel_obs, pixel_size=raw.e_pixel_size,
         ),

@@ -285,6 +285,7 @@ def make_environment(args):
         environment = AntMaze(
             backend=args.env.backend,
             maze_layout_name=layouts[args.env.id],
+            dense_reward=getattr(args.env, "dense_reward", False),
         )
         fixed_goal = getattr(args.env, "fixed_goal", None)
         if fixed_goal is not None:
