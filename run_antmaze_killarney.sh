@@ -37,7 +37,19 @@
 
 set -euo pipefail
 
-module load python/3.11.5
+# `module` is a shell function defined by the login profile, and a batch shell
+# does not always source it.  Initialise it if missing; if it still is not
+# there, the venv interpreter alone is enough because /cvmfs is always mounted.
+if ! command -v module >/dev/null 2>&1; then
+  for init in /cvmfs/soft.computecanada.ca/config/profile/bash.sh               /etc/profile.d/modules.sh; do
+    if [ -r "$init" ]; then . "$init"; break; fi
+  done
+fi
+if command -v module >/dev/null 2>&1; then
+  module load python/3.11.5
+else
+  echo "WARNING: module unavailable; relying on the venv interpreter" >&2
+fi
 
 VENV="${SHNEO_VENV:-/project/aip-isabeau/$USER/venvs/pybrax}"
 # Alliance refuses jobs submitted from /home, so the repo lives on /project
@@ -46,6 +58,7 @@ VENV="${SHNEO_VENV:-/project/aip-isabeau/$USER/venvs/pybrax}"
 REPO="${SHNEO_REPO:-${SLURM_SUBMIT_DIR:-$PWD}}"
 source "$VENV/bin/activate"
 cd "$REPO"
+echo "python: $(command -v python)"
 
 # Keep W&B run directories and checkpoints off /home: its inode quota is the
 # binding limit on this cluster, not its capacity.
