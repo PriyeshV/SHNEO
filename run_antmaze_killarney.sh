@@ -1,6 +1,7 @@
 #!/bin/bash
 # AntMaze results for the paper, on Killarney (Alliance Canada).
 #
+#   cd /project/aip-isabeau/$USER/SHNEO     # NOT /home: Alliance rejects those
 #   sbatch run_antmaze_killarney.sh
 #   # different allocation:
 #   sbatch --account=aip-dprecup run_antmaze_killarney.sh
@@ -39,7 +40,10 @@ set -euo pipefail
 module load python/3.11.5
 
 VENV="${SHNEO_VENV:-/project/aip-isabeau/$USER/venvs/pybrax}"
-REPO="${SHNEO_REPO:-$HOME/projects/SHNEO}"
+# Alliance refuses jobs submitted from /home, so the repo lives on /project
+# or /scratch.  SLURM_SUBMIT_DIR is wherever you ran sbatch, which keeps this
+# working no matter where the checkout ends up.
+REPO="${SHNEO_REPO:-${SLURM_SUBMIT_DIR:-$PWD}}"
 source "$VENV/bin/activate"
 cd "$REPO"
 
