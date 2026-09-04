@@ -39,6 +39,7 @@ import jax  # noqa: E402
 from brax.training.agents.sac import train as sac_train  # noqa: E402
 from src.mains.ant_maze.sac_utils import (  # noqa: E402
     SuccessRateAUC,
+    ensure_device_put_replicated,
     make_environment,
     make_network_factory,
     make_progress_fn,
@@ -47,6 +48,10 @@ from src.mains.ant_maze.sac_utils import (  # noqa: E402
 
 def train(args=ARGS, environment=None):
     """Runs SAC and returns Brax's (inference_fn, params, final_metrics)."""
+
+    # Brax's trainer still calls an API jax removed in 0.10; put it back
+    # rather than forking the trainer or downgrading jax.
+    ensure_device_put_replicated()
 
     if args.algo.save_video:
         raise NotImplementedError(

@@ -46,6 +46,43 @@ SAC_RND_METRIC_ALIASES = {
 }
 
 
+def ensure_device_put_replicated():
+    """Reattach ``jax.device_put_replicated`` for Brax's stock trainers.
+
+    Brax 0.14.2's SAC trainer builds its replicated training state with
+    ``jax.device_put_replicated`` (``agents/sac/train.py:111``), which jax
+    removed in 0.10.0.  Pinning jax backwards is not an option: brax 0.14.2
+    requires ``orbax-checkpoint>=0.11.22``, which requires ``jax>=0.5.0``,
+    while the removed API needs ``jax<=0.4.29`` -- the windows do not overlap.
+
+    Reattaching an equivalent keeps SAC.py, the project's designated baseline,
+    running on Brax's maintained trainer rather than a fork.  The replacement
+    is the one from jax's own pmap migration guide.
+    """
+
+    import jax
+
+    if getattr(jax, "device_put_replicated", None) is not None:
+        return
+
+    import jax.numpy as jnp
+    import numpy as np
+
+    def device_put_replicated(value, devices):
+        mesh = jax.sharding.Mesh(np.array(devices), ("x",))
+        sharding = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec("x")
+        )
+        return jax.tree_util.tree_map(
+            lambda leaf: jax.device_put(
+                jnp.stack([leaf] * len(devices)), sharding
+            ),
+            value,
+        )
+
+    jax.device_put_replicated = device_put_replicated
+
+
 def make_network_factory(args):
     """Builds a Brax SAC network factory with project-configured dimensions."""
 
@@ -323,6 +360,7 @@ def make_environment(args):
 
 __all__ = [
     "SAC_METRIC_ALIASES",
+    "ensure_device_put_replicated",
     "SAC_RND_METRIC_ALIASES",
     "SuccessRateAUC",
     "TerminateOnSuccessWrapper",

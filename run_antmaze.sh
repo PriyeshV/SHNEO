@@ -9,7 +9,8 @@
 # setting.  The SAC actor and critics consume the vector observation in every
 # arm; only the novelty model and the Laplacian differ.
 #
-#   SAC           no exploration bonus (a_int_coef 0).
+#   SAC           the project's designated baseline, SAC.py on Brax's own
+#                 maintained SAC trainer.
 #   SAC_RND       RND on the primitive policy, a_int_coef at its 1.0 default.
 #   NEO           eigen-options WITHOUT the novelty bonus (neo_rnd_coef 0).
 #                 This is the "direct extension of NEO" baseline.
@@ -74,7 +75,7 @@ if [ "$SEED" -eq 0 ]; then
 fi
 
 case "$TAG" in
-  SAC)          SCRIPT=src/mains/ant_maze/RND.py; EXTRA=(--a_int_coef 0) ;;
+  SAC)          SCRIPT=src/mains/ant_maze/SAC.py; EXTRA=() ;;
   SAC_RND)      SCRIPT=src/mains/ant_maze/RND.py; EXTRA=() ;;
   NEO)          SCRIPT=src/mains/ant_maze/NEO.py; EXTRA=(--neo_rnd_coef 0) ;;
   NEO_reliable) SCRIPT=src/mains/ant_maze/NEO.py; EXTRA=() ;;
