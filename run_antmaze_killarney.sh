@@ -73,6 +73,12 @@ ARM_INDEX=$(( SLURM_ARRAY_TASK_ID / SEEDS_PER_ARM ))
 SEED=$((      SLURM_ARRAY_TASK_ID % SEEDS_PER_ARM ))
 TAG="${ARMS[$ARM_INDEX]}"
 
+# The 48 pre-fix runs already in this project use the bare arm names as their
+# group, and they ran the simplified option code: fixed 5-step durations and
+# epsilon doubling as the option rate.  Suffix this array so the two sets stay
+# separable without deleting anything.  Override with SHNEO_SUFFIX.
+NAME="${TAG}_${SHNEO_SUFFIX:-v2}"
+
 COMMON=(
   --e_id ant_u_maze
   --e_pixel_obs True
@@ -81,12 +87,12 @@ COMMON=(
   --e_n_test_envs 64
   --a_n_evals 40
   --x_seed "$SEED"
-  --x_file "$TAG"
-  --wb_model "$TAG"
+  --x_file "$NAME"
+  --wb_model "$NAME"
 )
 
 if [ "$SEED" -eq 0 ]; then
-  CKPT="${SCRATCH}/shneo_ckpt/final_${TAG}_seed0"
+  CKPT="${SCRATCH}/shneo_ckpt/final_${NAME}_seed0"
   mkdir -p "$CKPT"
   COMMON+=(--a_checkpoint_logdir "$CKPT")
 fi
