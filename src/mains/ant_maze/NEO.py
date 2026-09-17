@@ -88,7 +88,12 @@ class PixelLaplacianEncoder(nn.Module):
         x = x.reshape((x.shape[0], -1))
         for width in self.hidden_dims:
             x = nn.relu(nn.Dense(width)(x))
-        return nn.Dense(self.output_dim)(x)
+        # No bias on the eigenfunction layer, as the reference ``Conv_Encoder``
+        # builds its MLP with ``last_bias=False``.  A bias lets the network
+        # emit a constant output cheaply, which is the trivial eigenfunction;
+        # without it phi_0 has to be a real mode, which is why the reference
+        # keeps phi_0 as an option.
+        return nn.Dense(self.output_dim, use_bias=False)(x)
 
 
 class OptionPolicy(nn.Module):
@@ -338,26 +343,31 @@ class SNEOExplorer:
     def _option_phi(self, phi):
         """The eigenfunction columns that back the options.
 
-        The first eigenfunction of a graph Laplacian is the trivial constant
-        one, so it carries no information and the reference agents skip it
-        (``eigs[1:1 + n_base_options]`` in ``pqn_neo_core``).  Using it as an
-        option, as this port used to, wastes one of ``n_options`` slots.
+        Matches ``_neo_eigen_rewards`` in ``src/mains/algorithms/NEO.py``,
+        which takes ``phis[:, :n_options]`` and notes that the ALLO Laplacian
+        "generally has no constant first eigenfunction".  So phi_0 is a real
+        mode -- the slowest one -- and the reference keeps it as an option.
+        Only the *duration* table skips index 0 (see ``_option_durations``).
         """
 
-        start = 1 if self.config.option_skip_first else 0
-        return phi[:, start : start + self.config.n_options]
+        return phi[:, : self.config.n_options]
 
     def _option_durations(self, eigenvalues):
-        """Per-option durations from the Laplacian eigenvalues.
+        """Per-option durations, mirroring ``pqn_neo_core`` exactly.
 
-        Mirrors ``eigenvalues_to_option_durations_skip_first``: an option that
-        follows a slow eigenmode (small lambda) must run for many steps before
-        it moves the agent anywhere, so its duration is ceil(1 / lambda),
-        clipped to the configured range.  ``eigenvalues`` is the Rayleigh
-        quotient EMA held in the explorer state, so the durations track the
-        Laplacian as it trains rather than staying at a fixed constant.
+        With ``o_eigdur_options`` off (the reference default) every option
+        runs for the fixed ``o_opt_dur``.  With it on, option i runs for
+        ceil(1 / lambda_{i+1}) clipped to the configured range, as
+        ``eigenvalues_to_option_durations_skip_first`` computes it, from the
+        Rayleigh-quotient EMA held in the explorer state.
         """
 
+        if not self.config.option_eigdur:
+            return jnp.full(
+                (self.config.n_options,),
+                self.config.option_duration,
+                dtype=jnp.int32,
+            )
         eigs = jnp.nan_to_num(
             jnp.reshape(eigenvalues, (-1,)), nan=0.0, posinf=0.0, neginf=0.0
         )
@@ -683,8 +693,15 @@ class SNEOExplorer:
                 rms_norm=False,
                 barrier_dims=1,
             )
-            rayleigh = jnp.sum(jnp.square(phi1 - phi0), axis=0) / (
-                jnp.sum(0.5 * (jnp.square(phi0) + jnp.square(phi1)), axis=0)
+            # Weighted by the valid edges, as ``compute_batch_eigenvalues_seq``
+            # does with ``valid_transitions``: a terminal -> reset pair is not
+            # a transition and its large phi jump would inflate the estimate.
+            edge_w = edge_valid[:, None]
+            rayleigh = jnp.sum(edge_w * jnp.square(phi1 - phi0), axis=0) / (
+                jnp.sum(
+                    edge_w * 0.5 * (jnp.square(phi0) + jnp.square(phi1)),
+                    axis=0,
+                )
                 + 1e-8
             )
             eig_reward = (

@@ -139,6 +139,7 @@ class SACOptionConfig:
     opt_dur_max: int
     mu_prob: float
     skip_first: bool
+    eigdur_options: bool
     hidden_dims: Tuple[int, ...]
     lr: float
     alpha_lr: float
@@ -240,6 +241,8 @@ class Config:
     def option_mu_prob(self): return self.options.mu_prob
     @property
     def option_skip_first(self): return self.options.skip_first
+    @property
+    def option_eigdur(self): return self.options.eigdur_options
     @property
     def eps_start(self): return self.sac.eps.start
     @property
@@ -390,25 +393,26 @@ def build_parser(profile: str = "sac_neo") -> argparse.ArgumentParser:
     # Continuous SAC options.
     parser.add_argument("--o_gamma", type=float, default=0.95)
     parser.add_argument("--o_n_options", type=_positive_int, default=5)
-    # Each option's duration is ceil(1 / lambda_i), clipped to
-    # [o_opt_dur_min, o_opt_dur_max], exactly as
-    # ``eigenvalues_to_option_durations_skip_first`` computes it for the
-    # discrete agents.  Coupling the timescale to the eigenvalue is what makes
-    # these eigen-options rather than fixed-length macro-actions: a slow mode
-    # (small lambda) has to run for many steps before it moves the agent
-    # anywhere.  ``o_opt_dur`` is no longer read by the trainers; set
-    # o_opt_dur_min == o_opt_dur_max to recover a fixed duration.
+    # Option durations, mirroring the discrete agents exactly.  With
+    # o_eigdur_options False (the reference default) every option runs for
+    # o_opt_dur steps.  With it True, option i runs for ceil(1 / lambda_{i+1})
+    # clipped to [o_opt_dur_min, o_opt_dur_max], as
+    # ``eigenvalues_to_option_durations_skip_first`` computes it.
     parser.add_argument("--o_opt_dur", type=_positive_int, default=5)
     parser.add_argument("--o_opt_dur_min", type=_positive_int, default=5)
     parser.add_argument("--o_opt_dur_max", type=_positive_int, default=50)
+    parser.add_argument("--o_eigdur_options", type=str2bool, default=False)
     # Probability that an exploratory decision picks an option rather than a
     # random primitive action.  The discrete agents split epsilon this way
     # (``explore_option = do_explore & (u_mu < mu_prob)``); the continuous port
     # had collapsed the two, which made epsilon alone the option rate.
     parser.add_argument("--o_mu_prob", type=float, default=0.5)
-    # The first Laplacian eigenfunction is the trivial constant one, so it
-    # carries no information and the reference agents skip it when building
-    # options.  Pass False to reproduce the earlier behaviour.
+    # Governs the DURATION table only, mirroring
+    # ``eigenvalues_to_option_durations_skip_first``: option i's duration comes
+    # from lambda_{i+1}.  Option i's REWARD always comes from phi_i, including
+    # phi_0, exactly as ``_neo_eigen_rewards`` does -- the ALLO Laplacian has
+    # no constant first eigenfunction, so phi_0 is the slowest real mode and
+    # the most useful option for long-range exploration.
     parser.add_argument("--o_skip_first", type=str2bool, default=True)
     parser.add_argument("--o_dims", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--o_lr", type=float, default=1e-4)
@@ -454,12 +458,15 @@ def parse_args(profile: str = "sac_neo") -> Config:
     positive_dims = (*raw.c_dims, *raw.r_dims, *raw.lap_hidden_dims, *raw.o_dims)
     if any(width <= 0 for width in positive_dims):
         raise ValueError("all network dimensions must be positive")
-    # Skipping the trivial first eigenfunction costs one Laplacian dimension.
-    required_dims = raw.o_n_options + (1 if raw.o_skip_first else 0)
+    # Rewards use phi_0..phi_{n-1}; eigenvalue durations use lambda_1..lambda_n
+    # when both o_eigdur_options and o_skip_first are set, which needs one
+    # more Laplacian dimension.
+    needs_skip = raw.o_eigdur_options and raw.o_skip_first
+    required_dims = raw.o_n_options + (1 if needs_skip else 0)
     if raw.lap_dims < required_dims:
         raise ValueError(
             "lap_dims must be at least o_n_options, plus one more when "
-            "o_skip_first is set"
+            "o_eigdur_options and o_skip_first are both set"
         )
     if raw.o_opt_dur_min > raw.o_opt_dur_max:
         raise ValueError("require o_opt_dur_min <= o_opt_dur_max")
@@ -567,7 +574,8 @@ def parse_args(profile: str = "sac_neo") -> Config:
             gamma=raw.o_gamma, n_options=raw.o_n_options,
             opt_dur=raw.o_opt_dur, opt_dur_min=raw.o_opt_dur_min,
             opt_dur_max=raw.o_opt_dur_max, mu_prob=raw.o_mu_prob,
-            skip_first=raw.o_skip_first, hidden_dims=tuple(raw.o_dims),
+            skip_first=raw.o_skip_first, eigdur_options=raw.o_eigdur_options,
+            hidden_dims=tuple(raw.o_dims),
             lr=raw.o_lr, alpha_lr=raw.o_alpha_lr,
             target_entropy_scale=raw.o_target_entropy_scale, tau=raw.o_tau,
         ),
