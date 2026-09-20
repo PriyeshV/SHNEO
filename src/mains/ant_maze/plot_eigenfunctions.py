@@ -40,6 +40,22 @@ from brax.io import model  # noqa: E402
 from src.mains.ant_maze.pixel_ant_maze import ANT_MAZE_LAYOUTS  # noqa: E402
 
 
+def _import_laplacian_mlp():
+    """Imports the encoder without letting the trainer see this tool's argv.
+
+    ``NEO_LapXY`` parses the SAC command line at import time (``ARGS = ...``
+    at module scope), so importing it with ``--checkpoint`` on ``sys.argv``
+    fails.  Hand it an empty command line for the duration of the import.
+    """
+
+    saved, sys.argv = sys.argv, [sys.argv[0], "--wb_on", "False"]
+    try:
+        from src.mains.ant_maze.NEO_LapXY import LaplacianMLP
+    finally:
+        sys.argv = saved
+    return LaplacianMLP
+
+
 def _wall_mask(layout, scale):
     """Boolean wall grid plus the world extent of the layout."""
 
@@ -155,24 +171,40 @@ def main() -> None:
             "*_explore_*.pkl file, not the policy checkpoint."
         )
     lap_params = jax.tree_util.tree_map(jnp.asarray, payload["lap_params"])
+    # Empty for runs trained without batch norm; the module then has no
+    # BatchNorm layers and the collection is simply unused.
+    batch_stats = jax.tree_util.tree_map(
+        jnp.asarray, payload.get("lap_batch_stats", {})
+    )
 
     # Rebuild the encoder from the checkpoint rather than the config, so the
-    # script stays correct if the run used non-default widths.
+    # script stays correct if the run used non-default widths -- and apply
+    # the real module rather than a hand-rolled forward pass, so it stays
+    # correct as the module changes (no output bias, optional batch norm).
     dense = sorted(
         (name for name in lap_params if name.startswith("Dense_")),
         key=lambda name: int(name.split("_")[1]),
     )
     widths = [lap_params[name]["kernel"].shape[1] for name in dense]
-    output_dim = widths[-1]
-    print(f"encoder: 2 -> {' -> '.join(str(w) for w in widths)}")
+    print(f"encoder: 2 -> {' -> '.join(str(w) for w in widths)}"
+          f"{'  (batch norm)' if batch_stats else ''}")
+    LaplacianMLP = _import_laplacian_mlp()
+    net = LaplacianMLP(
+        hidden_dims=tuple(widths[:-1]),
+        output_dim=widths[-1],
+        batch_norm=bool(batch_stats),
+    )
+
+    # Checkpoints from before the encoder normalised its input carry no
+    # scale; 1.0 reproduces what they were trained on.
+    xy_scale = float(payload.get("xy_scale", 1.0))
 
     def apply(xy):
-        h = xy
-        for name in dense[:-1]:
-            p = lap_params[name]
-            h = jax.nn.relu(h @ p["kernel"] + p["bias"])
-        p = lap_params[dense[-1]]
-        return h @ p["kernel"] + p["bias"]
+        return net.apply(
+            {"params": lap_params, "batch_stats": batch_stats},
+            xy / xy_scale,
+            train=False,
+        )
 
     layout = ANT_MAZE_LAYOUTS[args.maze]
     wall, extent = _wall_mask(layout, args.scale)
@@ -184,7 +216,7 @@ def main() -> None:
     blocked = _is_wall(points, wall, args.scale)
     phi[blocked] = np.nan  # walls are unreachable, so leave them blank
 
-    n_show = min(args.n_show, output_dim)
+    n_show = min(args.n_show, widths[-1])
     fig, axes = plt.subplots(1, n_show, figsize=(3.1 * n_show, 3.4), constrained_layout=True)
     axes = np.atleast_1d(axes)
     for m in range(n_show):

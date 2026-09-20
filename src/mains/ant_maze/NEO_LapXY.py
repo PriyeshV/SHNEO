@@ -56,6 +56,10 @@ from src.losses.laplacian import (  # noqa: E402
     multi_step_ALLO,
     update_ALLO_parameters,
 )
+from src.mains.algorithms.Laplacian import (  # noqa: E402
+    compute_batch_eigenvalues_seq,
+)
+from src.mains.ant_maze.pixel_ant_maze import ANT_MAZE_LAYOUTS  # noqa: E402
 from src.mains.ant_maze.RND import (  # noqa: E402
     _PMAP_AXIS_NAME,
     _apply_gradients,
@@ -69,17 +73,37 @@ os.environ.pop("HEO_SAC_RND_LIBRARY_MODE", None)
 
 _GOAL_DIMS = 2
 _PRIMITIVE = -1
+# JaxGCRL AntMaze and PixelAntMazeWrapper both default maze_size_scaling to
+# 4.0; one cell is 4 world units.
+_MAZE_SIZE_SCALING = 4.0
+_LAYOUT_BY_ENV_ID = {
+    "ant_u_maze": "u_maze",
+    "ant_big_maze": "big_maze",
+    "ant_hardest_maze": "hardest_maze",
+}
 
 
 class LaplacianMLP(nn.Module):
     hidden_dims: Tuple[int, ...]
     output_dim: int
+    batch_norm: bool = False
 
     @nn.compact
-    def __call__(self, xy):
+    def __call__(self, xy, train: bool = False):
         x = xy
         for width in self.hidden_dims:
-            x = nn.relu(nn.Dense(width)(x))
+            x = nn.Dense(width)(x)
+            if self.batch_norm:
+                # Dense -> BatchNorm -> activation on hidden layers, as the
+                # reference ``apply_layer`` does.  This is what keeps phi at a
+                # controlled scale: the ALLO dual term rewards a larger
+                # ||phi|| (its optimal duals are negative), and once the norm
+                # outruns the barrier the orthonormality constraint can never
+                # be recovered.  Without it the xy Laplacian reached mean
+                # |cos| 0.47 against the true eigenvectors and then collapsed
+                # to 0.18 in 500k steps as the Gram diagonals grew to ~350.
+                x = nn.BatchNorm(use_running_average=not train)(x)
+            x = nn.relu(x)
         # No bias on the eigenfunction layer, as the reference ``Conv_Encoder``
         # builds its MLP with ``last_bias=False``.  A bias lets the network
         # emit a constant output cheaply, which is the trivial eigenfunction;
@@ -132,7 +156,16 @@ class OptionCritic(nn.Module):
 @flax.struct.dataclass
 class SNEOState:
     lap_params: Any
+    lap_batch_stats: Any
     lap_optimizer_state: optax.OptState
+    # Rolling per-env window of the last lap_seq_len states, oldest first:
+    # the on-policy sequence the reference trains its Laplacian on.  Each
+    # entry is the state s_t, whether the transition out of it ended the
+    # episode, and s_t's own novelty and zeta.
+    lap_seq_xy: jax.Array        # [envs, K, 2]
+    lap_seq_done: jax.Array      # [envs, K]
+    lap_seq_novelty: jax.Array   # [envs, K]
+    lap_seq_zeta: jax.Array      # [envs, K]
     barrier_coeffs: jax.Array
     betas: jax.Array
     errors: jax.Array
@@ -250,8 +283,15 @@ class SNEOExplorer:
         self.action_size = action_size
         self.target_network = target_network
         self.predictor_network = predictor_network
+        # The reference feeds its encoder unit-scaled input (img_norm divides
+        # pixels by 255).  Divide torso xy by the maze's world extent so the
+        # Laplacian sees coordinates in roughly [0, 1] too.
+        layout = ANT_MAZE_LAYOUTS[_LAYOUT_BY_ENV_ID[args.env.id]]
+        self.xy_scale = float(len(layout) * _MAZE_SIZE_SCALING)
         self.lap_network = LaplacianMLP(
-            self.config.lap_hidden_dims, self.config.lap_dims
+            self.config.lap_hidden_dims,
+            self.config.lap_dims,
+            batch_norm=self.config.laplacian.batch_norm,
         )
         self.option_policy = OptionPolicy(
             self.config.option_hidden_dims,
@@ -279,7 +319,25 @@ class SNEOExplorer:
     def _lap_obs(self, observation):
         # AntMaze's first two state entries are the global torso x/y position.
         # The desired-goal coordinates are deliberately excluded.
-        return observation[..., :2]
+        return observation[..., :2] / self.xy_scale
+
+    def _lap_apply(self, params, batch_stats, xy, train):
+        """Evaluates the Laplacian encoder, returning ``(phi, batch_stats)``.
+
+        With ``train=True`` batch norm uses batch statistics and the returned
+        ``batch_stats`` are the updated running averages, as the reference's
+        ``mutable=["batch_stats"]`` apply does.  With ``train=False`` it uses
+        the running averages and returns them unchanged.  Without batch norm
+        ``batch_stats`` is an empty collection and passes straight through.
+        """
+
+        variables = {"params": params, "batch_stats": batch_stats}
+        if train and self.config.laplacian.batch_norm:
+            phi, updates = self.lap_network.apply(
+                variables, xy, train=True, mutable=["batch_stats"]
+            )
+            return phi, updates["batch_stats"]
+        return self.lap_network.apply(variables, xy, train=False), batch_stats
 
     def _option_phi(self, phi):
         """The eigenfunction columns that back the options.
@@ -347,16 +405,28 @@ class SNEOExplorer:
         dummy_actions = jnp.zeros(
             (1, self.config.n_options, self.action_size), dtype=jnp.float32
         )
-        lap_params = self.lap_network.init(lap_key, dummy_xy)["params"]
+        lap_variables = self.lap_network.init(lap_key, dummy_xy, train=False)
+        lap_params = lap_variables["params"]
+        # Absent without batch norm; an empty collection keeps every apply
+        # and lax.cond branch pytree-consistent either way.
+        lap_batch_stats = lap_variables.get("batch_stats", {})
         policy_params = self.option_policy.init(policy_key, dummy_obs)["params"]
         q_params = {
             "eig": self.option_q.init(q_eig_key, dummy_obs, dummy_actions)["params"],
             "int": self.option_q.init(q_int_key, dummy_obs, dummy_actions)["params"],
         }
         log_alpha = jnp.zeros((self.config.n_options,), dtype=jnp.float32)
+        seq = (local_envs, self.config.lap_seq_len)
         return SNEOState(
             lap_params=lap_params,
+            lap_batch_stats=lap_batch_stats,
             lap_optimizer_state=self.lap_optimizer.init(lap_params),
+            lap_seq_xy=jnp.zeros(seq + (2,), dtype=jnp.float32),
+            # done=1 everywhere until real states shift in, so the sample
+            # mask excludes the padding without any separate fill counter.
+            lap_seq_done=jnp.ones(seq, dtype=jnp.float32),
+            lap_seq_novelty=jnp.ones(seq, dtype=jnp.float32),
+            lap_seq_zeta=jnp.zeros(seq, dtype=jnp.float32),
             barrier_coeffs=(
                 jnp.ones((1, 1), dtype=jnp.float32)
                 * (
@@ -546,35 +616,23 @@ class SNEOExplorer:
         zeta = jnp.clip(raw_zeta * scale, 0.0, self.config.neo_delta)
         return novelty_n, inv, zeta, max_inv, scale
 
-    def _zeta_at(self, extra, novelty):
-        """zeta for an arbitrary batch, holding the calibration EMAs fixed.
-
-        ``_zeta`` advances ``max_inv_ema`` and ``mean_scale_ema``, which must
-        track the *online* novelty distribution.  Scoring a replay batch must
-        not disturb that, so this reproduces the same mapping using whatever
-        calibration ``extra`` currently carries.
-        """
-
-        novelty_n = jnp.clip(
-            novelty / (extra.rnd_bonus_max_ema + 1e-8), 0.0, 1.0
-        )
-        inv = jnp.minimum(1.0 / (novelty_n + 1e-6), self.config.neo_inv_cap)
-        x = jnp.clip(inv / jnp.maximum(extra.max_inv_ema, 1e-8), 0.0, 1.0)
-        raw_zeta = self.config.neo_delta * jnp.power(x, 1.0 / self.config.neo_k)
-        return jnp.clip(
-            raw_zeta * extra.mean_scale_ema, 0.0, self.config.neo_delta
-        )
-
     def checkpoint_params(self, extra):
         """Parameters worth keeping for post-hoc analysis of a NEO run."""
 
         return {
             "lap_params": extra.lap_params,
+            "lap_batch_stats": extra.lap_batch_stats,
+            # The encoder consumes torso xy divided by this; tools that
+            # evaluate phi on raw coordinates must apply the same scaling.
+            "xy_scale": jnp.asarray(self.xy_scale, dtype=jnp.float32),
             "option_policy_params": extra.option_policy_params,
             "eigenvalues": extra.eigenvalues,
         }
 
     def fresh_update(self, extra, train_state, transitions, key, replay=None):
+        # The Laplacian trains on the on-policy window kept in ``extra`` --
+        # the port of the reference's per-env rollout -- so replay is unused.
+        del replay
         rnd_pixels = transitions.extras.get("rnd_pixels")
         pixels0 = None if rnd_pixels is None else rnd_pixels["observation"]
         pixels1 = None if rnd_pixels is None else rnd_pixels["next_observation"]
@@ -593,184 +651,185 @@ class SNEOExplorer:
         )
         extra = extra.replace(rnd_bonus_max_ema=bonus_max)
         novelty_n, inv, zeta, max_inv, scale = self._zeta(extra, all_novelty)
-        # Apply the advanced calibration now so the replay batch below is
-        # scored with the same EMAs the online statistics just produced.
-        extra = extra.replace(max_inv_ema=max_inv, mean_scale_ema=scale)
+        batch = novelty0.shape[0]
+        zeta0 = zeta[:batch]
 
-        # The Laplacian consumes torso xy, which replay already stores, so it
-        # trains on a decorrelated replay batch instead of the e_n_envs
-        # correlated transitions from this step.  A 32-dimensional embedding
-        # needs far more than e_n_envs samples for its Gram matrix to be
-        # estimable, which is what both reference agents give it.
-        lap_src = transitions if replay is None else replay
-        if replay is None:
-            lap_novelty1 = novelty1
-            lap_zeta0, lap_zeta1 = zeta[: novelty0.shape[0]], zeta[novelty0.shape[0] :]
-        else:
-            lap_novelty0 = self._normalized_novelty(
-                train_state, replay.observation
-            )
-            lap_novelty1 = self._normalized_novelty(
-                train_state, replay.next_observation
-            )
-            lap_zeta0 = self._zeta_at(extra, lap_novelty0)
-            lap_zeta1 = self._zeta_at(extra, lap_novelty1)
-
-        xy0 = self._lap_obs(lap_src.observation)
-        xy1 = self._lap_obs(lap_src.next_observation)
+        xy0 = self._lap_obs(transitions.observation)
+        xy1 = self._lap_obs(transitions.next_observation)
         # Brax's AutoResetWrapper overwrites next_observation with the
         # episode's *initial* observation whenever done, so a done transition
-        # is not a graph edge: keeping it would wire every terminal state to
-        # the maze start.  JaxGCRL AntMaze terminates on unhealthy z as well
-        # as on the time limit, so this is not a rare event early in training
-        # and ``1 - truncation`` misses all of it.  ``discount`` is
-        # ``1 - done`` and covers both cases.
-        edge_valid = lap_src.discount
-        lap_novelty = self._lap_novelty(train_state, lap_novelty1)
+        # is not a graph edge.  ``discount`` is ``1 - done`` and covers both
+        # termination and the time limit.
+        done0 = 1.0 - transitions.discount
 
-        def lap_loss(params):
-            phi0 = self.lap_network.apply({"params": params}, xy0)
-            phi1 = self.lap_network.apply({"params": params}, xy1)
-            valid = edge_valid
-            total, (positive, ortho, dual_diagnostic), (_, error_matrix) = multi_step_ALLO(
-                key=key,
-                phis_all=phi0,
-                future_phis_all=phi1[:, None, :],
-                actions=jnp.zeros((phi0.shape[0], 1), dtype=jnp.int32),
-                sample_mask=valid.astype(jnp.bool_),
-                masks=valid[:, None].astype(jnp.bool_),
-                barrier_coeffs=extra.barrier_coeffs,
-                betas=extra.betas,
-                weights=None,
-                novelty_values=lap_novelty[:, None],
-                zeta_values=jnp.stack([lap_zeta0, lap_zeta1], axis=1),
-                use_novelty=self.config.lap_novel_weight,
-                use_zeta=True,
-                normalize_zeta=False,
-                gamma=self.args.env.gamma,
-                state_action=False,
-                uni_policy=False,
-                n_steps=1,
-                use_dual=self.config.laplacian.dual.on,
-                use_weights=False,
-                average_loss=self.config.lap_average_loss,
-                rms_norm=False,
-                barrier_dims=1,
-            )
-            # Weighted by the valid edges, as ``compute_batch_eigenvalues_seq``
-            # does with ``valid_transitions``: a terminal -> reset pair is not
-            # a transition and its large phi jump would inflate the estimate.
-            edge_w = edge_valid[:, None]
-            rayleigh = jnp.sum(edge_w * jnp.square(phi1 - phi0), axis=0) / (
-                jnp.sum(
-                    edge_w * 0.5 * (jnp.square(phi0) + jnp.square(phi1)),
-                    axis=0,
-                )
-                + 1e-8
-            )
-            eig_reward = (
-                jnp.abs(self._option_phi(phi1))
-                - jnp.abs(self._option_phi(phi0))
-            ) * edge_valid[:, None]
-            return total, (
-                positive,
-                ortho,
-                dual_diagnostic,
-                rayleigh,
-                eig_reward,
-                error_matrix,
-            )
+        # Append s_t to the per-env window (oldest first).  Novelty and zeta
+        # are those of s_t itself.  The reference stores the novelty of
+        # s_{t+1} at index t and so pairs each future state with its
+        # successor's novelty; the intent is plainly the state's own, and
+        # that is what is stored here.
+        def push(buffer, value):
+            return jnp.concatenate([buffer[:, 1:], value[:, None]], axis=1)
 
-        actor_steps = train_state.env_steps // (
-            self.args.env.n_envs * self.args.env.action_repeat
+        seq_xy = jnp.concatenate(
+            [extra.lap_seq_xy[:, 1:], xy0[:, None, :]], axis=1
         )
-        should_update_lap = (
-            actor_steps % self.config.lap_update_interval == 0
+        seq_done = push(extra.lap_seq_done, done0)
+        seq_novelty = push(
+            extra.lap_seq_novelty, self._lap_novelty(train_state, novelty0)
+        )
+        seq_zeta = push(extra.lap_seq_zeta, zeta0)
+        extra = extra.replace(
+            lap_seq_xy=seq_xy,
+            lap_seq_done=seq_done,
+            lap_seq_novelty=seq_novelty,
+            lap_seq_zeta=seq_zeta,
+        )
+
+        # Masks exactly as ``update_neo_laplacian_network`` forms them: the
+        # anchor's own transition must not have ended the episode, each
+        # future is valid up to the first terminal transition after it, and
+        # an eigenvalue pair needs both endpoints alive.
+        n_envs, seq_len = seq_done.shape
+        n_steps = seq_len - 1
+        masks = 1.0 - seq_done
+        sample_mask = masks[:, 0]
+        future_masks = masks[:, 1:]
+        valid_trans = masks[:, :-1] * masks[:, 1:]
+
+        def lap_epoch(carry, _):
+            (
+                params,
+                batch_stats,
+                optimizer_state,
+                barrier_coeffs,
+                betas,
+                errors,
+                quadratic_errors,
+                eigenvalues,
+                epoch_key,
+            ) = carry
+            epoch_key, loss_key = jax.random.split(epoch_key)
+
+            def lap_loss(p):
+                # One forward pass over every state in the window, as the
+                # reference does over ``obs_flat``, so batch norm sees one
+                # set of statistics per update.
+                phi_flat, new_batch_stats = self._lap_apply(
+                    p, batch_stats, seq_xy.reshape(n_envs * seq_len, 2), train=True
+                )
+                phis = phi_flat.reshape(n_envs, seq_len, -1)
+                total, (positive, ortho, dual_diagnostic), (_, error_matrix) = multi_step_ALLO(
+                    key=loss_key,
+                    phis_all=phis[:, 0],
+                    future_phis_all=phis[:, 1:],
+                    actions=jnp.zeros((n_envs, n_steps), dtype=jnp.int32),
+                    sample_mask=sample_mask.astype(jnp.bool_),
+                    masks=future_masks.astype(jnp.bool_),
+                    barrier_coeffs=barrier_coeffs,
+                    betas=betas,
+                    weights=None,
+                    novelty_values=seq_novelty[:, 1:],
+                    zeta_values=seq_zeta,
+                    use_novelty=self.config.lap_novel_weight,
+                    use_zeta=True,
+                    normalize_zeta=False,
+                    gamma=self.args.env.gamma,
+                    state_action=False,
+                    uni_policy=False,
+                    n_steps=n_steps,
+                    use_dual=self.config.laplacian.dual.on,
+                    use_weights=False,
+                    average_loss=self.config.lap_average_loss,
+                    rms_norm=False,
+                    barrier_dims=1,
+                )
+                rayleigh = compute_batch_eigenvalues_seq(phis, valid_trans)
+                return total, (
+                    positive,
+                    ortho,
+                    dual_diagnostic,
+                    rayleigh,
+                    error_matrix,
+                    new_batch_stats,
+                )
+
+            (loss, aux), grads = jax.value_and_grad(lap_loss, has_aux=True)(params)
+            params, optimizer_state = _apply_gradients(
+                self.lap_optimizer, params, optimizer_state, grads
+            )
+            positive, ortho, dual_diagnostic, rayleigh, error_matrix, batch_stats = aux
+            pmean = lambda value: jax.lax.pmean(value, axis_name=_PMAP_AXIS_NAME)
+            rayleigh = pmean(rayleigh)
+            error_matrix = jax.tree_util.tree_map(pmean, error_matrix)
+            # Running averages are per-device statistics; average them the
+            # same way so every replica carries the same batch_stats.
+            batch_stats = jax.tree_util.tree_map(pmean, batch_stats)
+            eigenvalues = 0.9 * eigenvalues + 0.1 * rayleigh
+            allo = extra.replace(
+                barrier_coeffs=barrier_coeffs,
+                betas=betas,
+                errors=errors,
+                quadratic_errors=quadratic_errors,
+            )
+            if self.config.laplacian.barrier.on or self.config.laplacian.dual.on:
+                allo = update_ALLO_parameters(
+                    allo,
+                    error_matrix,
+                    self.config.laplacian.rate,
+                    self.config.laplacian.barrier,
+                    self.config.laplacian.dual,
+                    average_loss=self.config.lap_average_loss,
+                    barrier_dims=1,
+                )
+            carry = (
+                params,
+                batch_stats,
+                optimizer_state,
+                allo.barrier_coeffs,
+                allo.betas,
+                allo.errors,
+                allo.quadratic_errors,
+                eigenvalues,
+                epoch_key,
+            )
+            return carry, (loss, positive, ortho, dual_diagnostic)
+
+        init_carry = (
+            extra.lap_params,
+            extra.lap_batch_stats,
+            extra.lap_optimizer_state,
+            extra.barrier_coeffs,
+            extra.betas,
+            extra.errors,
+            extra.quadratic_errors,
+            extra.eigenvalues,
+            key,
         )
 
         def update_laplacian(_):
-            (loss, aux), grads = jax.value_and_grad(
-                lap_loss, has_aux=True
-            )(extra.lap_params)
-            lap_params, lap_optimizer_state = _apply_gradients(
-                self.lap_optimizer,
-                extra.lap_params,
-                extra.lap_optimizer_state,
-                grads,
+            # lap_epochs gradient steps on the same window, as the reference
+            # makes a_n_epochs passes over each rollout.  Metrics are the
+            # last pass's.
+            carry, stacked = jax.lax.scan(
+                lap_epoch, init_carry, None, length=self.config.lap_epochs
             )
-            (
-                positive,
-                ortho,
-                dual_diagnostic,
-                rayleigh,
-                eig_reward,
-                error_matrix,
-            ) = aux
-            rayleigh = jax.lax.pmean(
-                rayleigh, axis_name=_PMAP_AXIS_NAME
-            )
-            eigenvalues = 0.9 * extra.eigenvalues + 0.1 * rayleigh
-            error_matrix = jax.tree_util.tree_map(
-                lambda value: jax.lax.pmean(
-                    value, axis_name=_PMAP_AXIS_NAME
-                ),
-                error_matrix,
-            )
-            updated_extra = extra.replace(
-                lap_params=lap_params,
-                lap_optimizer_state=lap_optimizer_state,
-            )
-            updated_extra = update_ALLO_parameters(
-                updated_extra,
-                error_matrix,
-                self.config.laplacian.rate,
-                self.config.laplacian.barrier,
-                self.config.laplacian.dual,
-                average_loss=self.config.lap_average_loss,
-                barrier_dims=1,
-            )
-            return (
-                lap_params,
-                lap_optimizer_state,
-                updated_extra.barrier_coeffs,
-                updated_extra.betas,
-                updated_extra.errors,
-                updated_extra.quadratic_errors,
-                eigenvalues,
-                loss,
-                positive,
-                ortho,
-                dual_diagnostic,
-                eig_reward,
-            )
+            last = tuple(value[-1] for value in stacked)
+            return carry[:-1] + last
 
         def skip_laplacian(_):
-            # Still compute the current collection-time eigen-reward for
-            # diagnostics.  Only the optimizer update is skipped.
-            phi0 = self.lap_network.apply({"params": extra.lap_params}, xy0)
-            phi1 = self.lap_network.apply({"params": extra.lap_params}, xy1)
-            eig_reward = jax.lax.stop_gradient(
-                jnp.abs(self._option_phi(phi1))
-                - jnp.abs(self._option_phi(phi0))
-            ) * edge_valid[:, None]
             zero = jnp.asarray(0.0, dtype=jnp.float32)
-            return (
-                extra.lap_params,
-                extra.lap_optimizer_state,
-                extra.barrier_coeffs,
-                extra.betas,
-                extra.errors,
-                extra.quadratic_errors,
-                extra.eigenvalues,
-                zero,
-                zero,
-                zero,
-                zero,
-                eig_reward,
-            )
+            return init_carry[:-1] + (zero, zero, zero, zero)
 
+        # Once per full window: after actor step lap_seq_len the padding
+        # has shifted out entirely, and every lap_seq_len steps after that
+        # is a fresh rollout's worth of data, as in the reference.
+        actor_steps = train_state.env_steps // (
+            self.args.env.n_envs * self.args.env.action_repeat
+        )
+        should_update_lap = actor_steps % self.config.lap_seq_len == 0
         (
             lap_params,
+            lap_batch_stats,
             lap_optimizer_state,
             barrier_coeffs,
             betas,
@@ -781,7 +840,6 @@ class SNEOExplorer:
             positive,
             ortho,
             dual_diagnostic,
-            eig_reward,
         ) = jax.lax.cond(
             should_update_lap,
             update_laplacian,
@@ -790,6 +848,7 @@ class SNEOExplorer:
         )
         extra = extra.replace(
             lap_params=lap_params,
+            lap_batch_stats=lap_batch_stats,
             lap_optimizer_state=lap_optimizer_state,
             barrier_coeffs=barrier_coeffs,
             betas=betas,
@@ -799,6 +858,13 @@ class SNEOExplorer:
             mean_scale_ema=scale,
             eigenvalues=eigenvalues,
         )
+        # Collection-time eigen-reward for this step's transition, on the
+        # running batch-norm averages, for the diagnostics below.
+        phi0, _ = self._lap_apply(lap_params, lap_batch_stats, xy0, train=False)
+        phi1, _ = self._lap_apply(lap_params, lap_batch_stats, xy1, train=False)
+        eig_reward = jax.lax.stop_gradient(
+            jnp.abs(self._option_phi(phi1)) - jnp.abs(self._option_phi(phi0))
+        ) * transitions.discount[:, None]
         option_durations = self._option_durations(eigenvalues)
         metrics = {
             "Eigen/update": should_update_lap.astype(jnp.float32),
@@ -866,11 +932,17 @@ class SNEOExplorer:
         novelty_n = jnp.clip(
             novelty / (extra.rnd_bonus_max_ema + 1e-8), 0.0, 1.0
         )
-        phi0 = self.lap_network.apply(
-            {"params": extra.lap_params}, self._lap_obs(transitions.observation)
+        phi0, _ = self._lap_apply(
+            extra.lap_params,
+            extra.lap_batch_stats,
+            self._lap_obs(transitions.observation),
+            train=False,
         )
-        phi1 = self.lap_network.apply(
-            {"params": extra.lap_params}, self._lap_obs(transitions.next_observation)
+        phi1, _ = self._lap_apply(
+            extra.lap_params,
+            extra.lap_batch_stats,
+            self._lap_obs(transitions.next_observation),
+            train=False,
         )
         # Zero on a done transition: AutoResetWrapper made next_observation the
         # reset state, so the magnitude difference across it is meaningless.

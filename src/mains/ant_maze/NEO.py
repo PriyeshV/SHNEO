@@ -262,6 +262,11 @@ class SNEOExplorer:
         self.action_size = action_size
         self.target_network = target_network
         self.predictor_network = predictor_network
+        if self.config.laplacian.batch_norm:
+            raise NotImplementedError(
+                "PixelLaplacianEncoder does not thread batch_stats; batch "
+                "norm is implemented for the vector Laplacian in NEO_LapXY.py"
+            )
         self.lap_network = PixelLaplacianEncoder(
             self.config.lap_hidden_dims, self.config.lap_dims
         )

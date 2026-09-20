@@ -125,6 +125,8 @@ class SACLaplacianConfig:
     layer_norm: bool
     average_loss: bool
     n_step: int
+    seq_len: int
+    epochs: int
     barrier: BarrierConfig
     dual: DualConfig
     rate: RateConfig
@@ -192,6 +194,10 @@ class Config:
     def lap_pixel_size(self): return self.laplacian.pixel_size
     @property
     def lap_update_interval(self): return self.laplacian.update_interval
+    @property
+    def lap_seq_len(self): return self.laplacian.seq_len
+    @property
+    def lap_epochs(self): return self.laplacian.epochs
     @property
     def lap_lr(self): return self.laplacian.lr
     @property
@@ -361,7 +367,17 @@ def build_parser(profile: str = "sac_neo") -> argparse.ArgumentParser:
     # independent transitions, unlike PQN's contiguous 32-step rollout.
     parser.add_argument("--lap_lr", type=float, default=2.5e-4)
     parser.add_argument("--lap_dims", type=_positive_int, default=32)
-    parser.add_argument("--lap_hidden_dims", type=int, nargs="+", default=[256, 256])
+    # One 512-wide hidden layer, as the reference Conv_Encoder's MLP (c_dims).
+    parser.add_argument("--lap_hidden_dims", type=int, nargs="+", default=[512])
+    # The vector Laplacian (NEO_LapXY) trains on per-env sequences of the
+    # last lap_seq_len states, so the graph-drawing term is the gamma-
+    # discounted multi-step objective over lap_seq_len - 1 futures, exactly
+    # as the discrete agents train on their e_n_steps rollout.  It updates
+    # once per full window with lap_epochs gradient steps, matching the
+    # reference's a_n_epochs passes per rollout; lap_update_interval does not
+    # apply to it.  The pixel Laplacian (NEO.py) is still 1-step.
+    parser.add_argument("--lap_seq_len", type=_positive_int, default=32)
+    parser.add_argument("--lap_epochs", type=_positive_int, default=2)
     # PixelLaplacianEncoder runs the same VALID-padded 8x8/4, 4x4/2, 3x3/1
     # stack as the RND encoders, which cannot consume anything below 36 (see
     # _MIN_CONV_INPUT).  The previous default of 21 collapsed the third
@@ -468,6 +484,8 @@ def parse_args(profile: str = "sac_neo") -> Config:
             "lap_dims must be at least o_n_options, plus one more when "
             "o_eigdur_options and o_skip_first are both set"
         )
+    if raw.lap_seq_len < 2:
+        raise ValueError("lap_seq_len must be at least 2 (one anchor, one future)")
     if raw.o_opt_dur_min > raw.o_opt_dur_max:
         raise ValueError("require o_opt_dur_min <= o_opt_dur_max")
     if not 0.0 <= raw.o_mu_prob <= 1.0:
@@ -482,11 +500,14 @@ def parse_args(profile: str = "sac_neo") -> Config:
             "Laplacian shares the RND convolutional stack, whose third layer "
             "produces an empty feature map on smaller frames"
         )
-    if raw.lap_batch_norm or raw.lap_layer_norm:
+    # Batch norm is implemented by the vector Laplacian (NEO_LapXY), which
+    # threads Flax batch_stats through its state exactly as the discrete
+    # agents' Conv_Encoder does; the pixel encoder in NEO.py rejects it in
+    # configure().  Layer norm is not implemented by either.
+    if raw.lap_layer_norm:
         raise NotImplementedError(
-            "The current SAC Laplacian encoders do not maintain Flax "
-            "batch/layer-normalization state; keep lap_batch_norm=False and "
-            "lap_layer_norm=False rather than logging an unused setting"
+            "The SAC Laplacian encoders do not implement layer normalization; "
+            "keep lap_layer_norm=False rather than logging an unused setting"
         )
     if raw.lap_br_lr < 0.0 or raw.lap_dual_lr < 0.0:
         raise ValueError("lap_br_lr and lap_dual_lr must be non-negative")
@@ -557,7 +578,8 @@ def parse_args(profile: str = "sac_neo") -> Config:
             update_interval=lap_update_interval,
             max_grad_norm=raw.lap_max_grad_norm,
             batch_norm=raw.lap_batch_norm, layer_norm=raw.lap_layer_norm,
-            average_loss=raw.lap_average, n_step=1,
+            average_loss=raw.lap_average, n_step=raw.lap_seq_len - 1,
+            seq_len=raw.lap_seq_len, epochs=raw.lap_epochs,
             barrier=BarrierConfig(
                 on=raw.lap_br, lr=raw.lap_br_lr,
                 clip=raw.lap_br_clip, value=raw.lap_br_val,
