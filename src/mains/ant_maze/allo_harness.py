@@ -114,12 +114,15 @@ def per_mode_cosine(U, E, mu, tol=1e-8):
 
 # ---------------------------------------------------------------- random walk + samplers (from the harness)
 class Walk:
-    def __init__(self, maze, num_steps, episode_len, rng):
+    def __init__(self, maze, num_steps, episode_len, rng, spawn="uniform"):
         H = episode_len + 1
         n_ep = max(1, int(np.ceil(num_steps / H)))
         self.H, self.n_ep = H, n_ep
         self.pos = np.zeros((n_ep, H), dtype=np.int32)
-        s = rng.integers(maze.S, size=n_ep)
+        if spawn == "uniform":
+            s = rng.integers(maze.S, size=n_ep)
+        else:                                   # every episode begins at the ant's start cell
+            s = np.full(n_ep, maze.sub_index(START[None, :])[0])
         for h in range(H):
             self.pos[:, h] = s
             s = maze.T[s, rng.integers(4, size=n_ep)]
@@ -156,13 +159,17 @@ class AntWalk:
     ``push`` returns what NEO_LapXY.fresh_update appends to its window: xy(s_t) and done_t.
     """
 
-    def __init__(self, maze, n_envs, sigma, episode_len, rng, stagger):
+    def __init__(self, maze, n_envs, sigma, episode_len, rng, stagger, spawn="start"):
         self.maze, self.n, self.sigma, self.H, self.rng = maze, n_envs, sigma, episode_len, rng
+        self.spawn = spawn
         self.pos = self._spawn(n_envs)
         self.age = rng.integers(episode_len, size=n_envs) if stagger else np.zeros(n_envs, int)
         self.visited = np.zeros(maze.S, np.int64)
 
     def _spawn(self, n):
+        if self.spawn == "uniform":             # anywhere in the corridor: a uniform measure
+            centres = self.maze.world()[self.rng.integers(self.maze.S, size=n)]
+            return centres + (self.rng.uniform(size=(n, 2)) - 0.5) * (CELL / self.maze.sub)
         return START[None, :] + 0.1 * self.rng.normal(size=(n, 2))
 
     def push(self):
@@ -356,6 +363,9 @@ def main():
                     help="online: world units moved per step; the corridor is 4 wide")
     ap.add_argument("--stagger", action="store_true", help="online: random initial ages, so episodes "
                                                            "do not all reset together")
+    ap.add_argument("--spawn", choices=["start", "uniform"], default=None,
+                    help="where an episode begins: the ant's start cell or anywhere in the corridor. "
+                         "Default: uniform for --data uniform, start for --data online")
     ap.add_argument("--stride", type=int, default=1,
                     help="online: enter a state into the window every stride actor steps (frame-skip "
                          "for the Laplacian), so a window spans lap_seq_len * stride steps; the "
@@ -368,6 +378,7 @@ def main():
     a.episode_len = a.episode_len or (1000 if a.data == "online" else 50)
     a.eval_every = a.eval_every or (500 if a.data == "online" else 2000)
     a.epochs = a.epochs or (2 if a.data == "online" else 1)
+    a.spawn = a.spawn or ("start" if a.data == "online" else "uniform")
     a.barrier_init = a.barrier_init if a.barrier_init is not None else (0.1 if a.loss == "official" else 100.0)
     a.dual_lr = a.dual_lr if a.dual_lr is not None else (1e-4 if a.loss == "official" else 0.01)
     if a.data == "online" and a.loss == "official":
@@ -406,7 +417,8 @@ def main():
     print(f"[run] loss={a.loss} opt={a.opt} data={a.data} encoder={a.encoder} hidden={a.hidden} "
           f"bn={a.batch_norm} d={a.d} barrier_init={a.barrier_init} dual_lr={a.dual_lr}"
           + (f" n_steps={a.n_steps} epochs={a.epochs} zeta={a.zeta}" if a.loss == "shneo" else "")
-          + (f" sigma={a.sigma} episode_len={a.episode_len} stagger={a.stagger} stride={a.stride} "
+          + f" spawn={a.spawn} episode_len={a.episode_len}"
+          + (f" sigma={a.sigma} stagger={a.stagger} stride={a.stride} "
              f"gamma^stride={cfg['gamma']:.4f}" if a.data == "online" else ""))
 
     key = jax.random.PRNGKey(a.seed)
@@ -431,8 +443,10 @@ def main():
     report(0, m, t0)
 
     if a.data == "uniform":
-        walk = Walk(maze, a.num_samples, a.episode_len, rng)
-        print(f"[walk] {walk.n_ep} episodes x {walk.H} states")
+        walk = Walk(maze, a.num_samples, a.episode_len, rng, a.spawn)
+        counts = np.bincount(walk.pos_flat, minlength=maze.S)
+        print(f"[walk] {walk.n_ep} episodes x {walk.H} states from {a.spawn}: "
+              f"visited {int((counts > 0).sum())}/{maze.S}, top cell holds {counts.max() / counts.sum():.1%}")
         for it in range(1, a.num_updates + 1):
             if a.loss == "official":
                 i1, i2 = walk.sample_pairs(rng, a.batch, a.discount)
@@ -455,7 +469,7 @@ def main():
     # window is full.  With a stride, a state enters every stride steps and the done flag of the
     # newest entry keeps absorbing the dones of the steps until the next entry.
     K = a.n_steps + 1
-    ant = AntWalk(maze, a.seq_batch, a.sigma, a.episode_len, rng, a.stagger)
+    ant = AntWalk(maze, a.seq_batch, a.sigma, a.episode_len, rng, a.stagger, a.spawn)
     seq_xy = np.zeros((a.seq_batch, K, 2), np.float32)
     seq_done = np.ones((a.seq_batch, K), np.float32)      # SNEOState init: everything masked
     updates = 0
