@@ -356,6 +356,11 @@ def main():
                     help="online: world units moved per step; the corridor is 4 wide")
     ap.add_argument("--stagger", action="store_true", help="online: random initial ages, so episodes "
                                                            "do not all reset together")
+    ap.add_argument("--stride", type=int, default=1,
+                    help="online: enter a state into the window every stride actor steps (frame-skip "
+                         "for the Laplacian), so a window spans lap_seq_len * stride steps; the "
+                         "discount per window entry becomes gamma ** stride and an entry counts as "
+                         "done if the episode ended anywhere before the next entry")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     a.opt = a.opt or a.loss
@@ -397,11 +402,12 @@ def main():
         opt = optax.chain(optax.clip_by_global_norm(10.0), optax.adamw(2.5e-4, eps=1.5e-4))
     opt_state = opt.init(params)
     cfg = dict(dual_lr=a.dual_lr, barrier_lr=a.barrier_lr, barrier_init=a.barrier_init,
-               n_steps=a.n_steps, gamma=a.gamma, zeta=a.zeta)
+               n_steps=a.n_steps, gamma=a.gamma ** a.stride, zeta=a.zeta)
     print(f"[run] loss={a.loss} opt={a.opt} data={a.data} encoder={a.encoder} hidden={a.hidden} "
           f"bn={a.batch_norm} d={a.d} barrier_init={a.barrier_init} dual_lr={a.dual_lr}"
           + (f" n_steps={a.n_steps} epochs={a.epochs} zeta={a.zeta}" if a.loss == "shneo" else "")
-          + (f" sigma={a.sigma} episode_len={a.episode_len} stagger={a.stagger}" if a.data == "online" else ""))
+          + (f" sigma={a.sigma} episode_len={a.episode_len} stagger={a.stagger} stride={a.stride} "
+             f"gamma^stride={cfg['gamma']:.4f}" if a.data == "online" else ""))
 
     key = jax.random.PRNGKey(a.seed)
     if a.loss == "official":
@@ -445,7 +451,9 @@ def main():
                 report(it, np.asarray(m), t0)
         return
 
-    # --data online: the trainer's rolling window, updated once per full window.
+    # --data online: the trainer's rolling window, updated every lap_seq_len actor steps once the
+    # window is full.  With a stride, a state enters every stride steps and the done flag of the
+    # newest entry keeps absorbing the dones of the steps until the next entry.
     K = a.n_steps + 1
     ant = AntWalk(maze, a.seq_batch, a.sigma, a.episode_len, rng, a.stagger)
     seq_xy = np.zeros((a.seq_batch, K, 2), np.float32)
@@ -453,9 +461,12 @@ def main():
     updates = 0
     for t in range(1, a.actor_steps + 1):
         xy, done = ant.push()
-        seq_xy = np.concatenate([seq_xy[:, 1:], (xy / XY_SCALE)[:, None, :].astype(np.float32)], 1)
-        seq_done = np.concatenate([seq_done[:, 1:], done[:, None]], 1)
-        if t % K:
+        if (t - 1) % a.stride == 0:
+            seq_xy = np.concatenate([seq_xy[:, 1:], (xy / XY_SCALE)[:, None, :].astype(np.float32)], 1)
+            seq_done = np.concatenate([seq_done[:, 1:], done[:, None]], 1)
+        else:
+            seq_done[:, -1] = np.maximum(seq_done[:, -1], done)
+        if t % K or t < K * a.stride:
             continue
         x, dn = jnp.asarray(seq_xy), jnp.asarray(seq_done)
         for _ in range(a.epochs):
