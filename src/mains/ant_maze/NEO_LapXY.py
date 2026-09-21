@@ -731,7 +731,7 @@ class SNEOExplorer:
                     novelty_values=seq_novelty[:, 1:],
                     zeta_values=seq_zeta,
                     use_novelty=self.config.lap_novel_weight,
-                    use_zeta=True,
+                    use_zeta=self.config.lap_zeta_weight,
                     normalize_zeta=False,
                     gamma=self.args.env.gamma,
                     state_action=False,

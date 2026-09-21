@@ -686,7 +686,7 @@ class SNEOExplorer:
                 novelty_values=lap_novelty[:, None],
                 zeta_values=jnp.stack([zeta0, zeta1], axis=1),
                 use_novelty=self.config.lap_novel_weight,
-                use_zeta=True,
+                use_zeta=self.config.lap_zeta_weight,
                 normalize_zeta=False,
                 gamma=self.args.env.gamma,
                 state_action=False,

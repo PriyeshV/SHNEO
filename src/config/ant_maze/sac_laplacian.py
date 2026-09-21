@@ -156,6 +156,7 @@ class SACNEOConfig:
     target_mean: float
     rnd_coef: float
     lap_novel_weight: bool
+    lap_zeta_weight: bool
     ema_tau: float
     bonus_q: float
     inv_cap: float
@@ -209,6 +210,8 @@ class Config:
     def lap_average_loss(self): return self.laplacian.average_loss
     @property
     def lap_novel_weight(self): return self.neo.lap_novel_weight
+    @property
+    def lap_zeta_weight(self): return self.neo.lap_zeta_weight
     @property
     def neo_k(self): return self.neo.k
     @property
@@ -447,6 +450,12 @@ def build_parser(profile: str = "sac_neo") -> argparse.ArgumentParser:
     # ablation here, so pass --neo_rnd_coef 0 to obtain that baseline.
     parser.add_argument("--neo_rnd_coef", type=float, default=1.0)
     parser.add_argument("--neo_lap_wt", type=str2bool, default=True)
+    # The reliability (zeta) sink term of the Laplacian objective,
+    # E[zeta(s) * ||phi(s)||^2].  The reference hardcodes use_zeta=True; this
+    # flag exists so it can be ablated.  Measured on the U-corridor with the
+    # offline harness (allo_harness.py): at lap_dims 32 it lowers the first
+    # five modes' |cos| against the exact eigenvectors from 0.80 to 0.51.
+    parser.add_argument("--neo_lap_zeta", type=str2bool, default=True)
     parser.add_argument("--neo_ema_tau", type=float, default=1e-3)
     parser.add_argument("--neo_bonus_q", type=float, default=0.99)
     parser.add_argument("--neo_inv_cap", type=float, default=1e4)
@@ -604,7 +613,8 @@ def parse_args(profile: str = "sac_neo") -> Config:
         neo=SACNEOConfig(
             k=raw.neo_k, delta=raw.neo_delta,
             target_mean=raw.neo_targ_mean, rnd_coef=raw.neo_rnd_coef,
-            lap_novel_weight=raw.neo_lap_wt, ema_tau=raw.neo_ema_tau,
+            lap_novel_weight=raw.neo_lap_wt, lap_zeta_weight=raw.neo_lap_zeta,
+            ema_tau=raw.neo_ema_tau,
             bonus_q=raw.neo_bonus_q, inv_cap=raw.neo_inv_cap,
         ),
     )
