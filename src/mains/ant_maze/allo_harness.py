@@ -98,6 +98,26 @@ def exact_basis(maze, d):
     return mu[:d], E[:, :d]
 
 
+def weighted_basis(maze, counts, d):
+    """Eigenfunctions of the Laplacian under the visitation measure rho = counts / sum.
+
+    ALLO with anchors drawn from rho minimises the rho-weighted Dirichlet form subject to
+    rho-orthonormality, so its fixed point is the generalised problem L_rho v = lambda D v with
+    D = diag(rho) and L_rho = D - (D P + P^T D) / 2.  Returns (lambda, D^1/2 V) so the columns are
+    Euclidean-orthonormal and per_mode_cosine can score D^1/2 phi against them.
+    """
+    import scipy.linalg
+    P = np.zeros((maze.S, maze.S))
+    for s in range(maze.S):
+        for a in range(4):
+            P[s, maze.T[s, a]] += 0.25
+    rho = counts / counts.sum() + 1e-6 / maze.S
+    D = np.diag(rho)
+    L = D - 0.5 * (D @ P + P.T @ D)
+    mu, V = scipy.linalg.eigh(L, D)
+    return mu[:d], np.sqrt(rho)[:, None] * V[:, :d]
+
+
 def per_mode_cosine(U, E, mu, tol=1e-8):
     U = np.asarray(U, dtype=np.float64)
     U = U / (np.linalg.norm(U, axis=0, keepdims=True) + 1e-10)
@@ -429,14 +449,23 @@ def main():
     else:
         step, allo = make_shneo_step(enc, opt, a.d, cfg)
 
+    counts = np.ones(maze.S)
+
     def report(it, m, t0, extra=""):
         Phi = np.asarray(make_apply(enc)(params, batch_stats, bank, False)[0])
         cos = per_mode_cosine(Phi, E, mu)
         G = np.diag(Phi.T @ Phi / maze.S)
+        # The same phi scored against the eigenfunctions of the Laplacian under the data's own
+        # visitation measure: what the objective is actually asked to find.
+        mu_w, E_w = weighted_basis(maze, counts, a.d)
+        rho = counts / counts.sum() + 1e-6 / maze.S
+        cos_w = per_mode_cosine(np.sqrt(rho)[:, None] * Phi, E_w, mu_w)
         print(f"[{it:6d}] avg|cos| {cos.mean():.3f}  first5 {cos[:5].mean():.3f}  min {cos.min():.3f} | "
+              f"under rho: avg {cos_w.mean():.3f} first5 {cos_w[:5].mean():.3f} | "
               f"loss {m[0]:.3f} graph {m[1]:.3f} |err| {m[2]:.3f} |beta| {m[3]:.2f} b {m[4]:.3f} | "
               f"Gram diag [{G.min():.3g}, {G.max():.3g}] | {time.time() - t0:.0f}s{extra}")
-        print("          per-mode: " + " ".join(f"{c:.2f}" for c in cos[:min(a.d, 12)]))
+        print("          per-mode: " + " ".join(f"{c:.2f}" for c in cos[:min(a.d, 12)])
+              + "   under rho: " + " ".join(f"{c:.2f}" for c in cos_w[:min(a.d, 12)]))
 
     t0 = time.time()
     m = np.zeros(5)
@@ -444,7 +473,7 @@ def main():
 
     if a.data == "uniform":
         walk = Walk(maze, a.num_samples, a.episode_len, rng, a.spawn)
-        counts = np.bincount(walk.pos_flat, minlength=maze.S)
+        counts = np.bincount(walk.pos_flat, minlength=maze.S).astype(np.float64)
         print(f"[walk] {walk.n_ep} episodes x {walk.H} states from {a.spawn}: "
               f"visited {int((counts > 0).sum())}/{maze.S}, top cell holds {counts.max() / counts.sum():.1%}")
         for it in range(1, a.num_updates + 1):
@@ -470,6 +499,7 @@ def main():
     # newest entry keeps absorbing the dones of the steps until the next entry.
     K = a.n_steps + 1
     ant = AntWalk(maze, a.seq_batch, a.sigma, a.episode_len, rng, a.stagger, a.spawn)
+    counts = ant.visited                                  # filled in place as the walkers move
     seq_xy = np.zeros((a.seq_batch, K, 2), np.float32)
     seq_done = np.ones((a.seq_batch, K), np.float32)      # SNEOState init: everything masked
     updates = 0
