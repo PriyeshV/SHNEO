@@ -866,8 +866,21 @@ class SNEOExplorer:
             jnp.abs(self._option_phi(phi1)) - jnp.abs(self._option_phi(phi0))
         ) * transitions.discount[:, None]
         option_durations = self._option_durations(eigenvalues)
+        # How far the ant actually travels, in world units: one step, and the
+        # whole window the Laplacian trains on.  ALLO's constraint is an
+        # expectation under the state distribution, so it can only resolve the
+        # eigenfunctions once a batch spans the maze; a window span far below
+        # the corridor's length means every batch is one blob, whatever the
+        # cumulative state coverage looks like.
+        step_dist = jnp.linalg.norm(xy1 - xy0, axis=-1) * self.xy_scale
+        window_span = (
+            jnp.linalg.norm(seq_xy[:, -1] - seq_xy[:, 0], axis=-1) * self.xy_scale
+        )
         metrics = {
             "Eigen/update": should_update_lap.astype(jnp.float32),
+            "Explore/step_dist_mean": jnp.mean(step_dist),
+            "Explore/window_span_mean": jnp.mean(window_span),
+            "Explore/window_span_max": jnp.max(window_span),
             "Eigen/Total_loss": loss,
             "Eigen/Pos_loss": positive,
             "Eigen/Ortho_loss": ortho,
