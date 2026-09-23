@@ -383,6 +383,10 @@ def main():
                     help="online: world units moved per step; the corridor is 4 wide")
     ap.add_argument("--stagger", action="store_true", help="online: random initial ages, so episodes "
                                                            "do not all reset together")
+    ap.add_argument("--replay", type=int, default=0,
+                    help="online: keep this many past windows and train on a random draw of them "
+                         "instead of only the live rollout (0 = the trainer's behaviour). This is "
+                         "what feeding the Laplacian from SAC's replay buffer would look like")
     ap.add_argument("--spawn", choices=["start", "uniform"], default=None,
                     help="where an episode begins: the ant's start cell or anywhere in the corridor. "
                          "Default: uniform for --data uniform, start for --data online")
@@ -439,7 +443,8 @@ def main():
           + (f" n_steps={a.n_steps} epochs={a.epochs} zeta={a.zeta}" if a.loss == "shneo" else "")
           + f" spawn={a.spawn} episode_len={a.episode_len}"
           + (f" sigma={a.sigma} stagger={a.stagger} stride={a.stride} "
-             f"gamma^stride={cfg['gamma']:.4f}" if a.data == "online" else ""))
+             f"gamma^stride={cfg['gamma']:.4f} replay={a.replay or 'off'}"
+             if a.data == "online" else ""))
 
     key = jax.random.PRNGKey(a.seed)
     if a.loss == "official":
@@ -502,7 +507,22 @@ def main():
     counts = ant.visited                                  # filled in place as the walkers move
     seq_xy = np.zeros((a.seq_batch, K, 2), np.float32)
     seq_done = np.ones((a.seq_batch, K), np.float32)      # SNEOState init: everything masked
+    # --replay: keep every window the walkers produce and train on a random draw of them, the way
+    # SAC's off-policy learner could feed the Laplacian from its own 1M-transition buffer instead
+    # of only the live rollout.  Each window is stored once, so the buffer holds `replay` of them.
+    buf_xy = np.zeros((a.replay, K, 2), np.float32) if a.replay else None
+    buf_done = np.ones((a.replay, K), np.float32) if a.replay else None
+    filled = 0
     updates = 0
+
+    def batch(t):
+        """The windows this update trains on, and how far each one reaches."""
+        if not a.replay:
+            return seq_xy, seq_done
+        n = min(filled, a.replay)
+        idx = rng.integers(n, size=a.seq_batch)
+        return buf_xy[idx], buf_done[idx]
+
     for t in range(1, a.actor_steps + 1):
         xy, done = ant.push()
         if (t - 1) % a.stride == 0:
@@ -512,20 +532,29 @@ def main():
             seq_done[:, -1] = np.maximum(seq_done[:, -1], done)
         if t % K or t < K * a.stride:
             continue
-        x, dn = jnp.asarray(seq_xy), jnp.asarray(seq_done)
+        if a.replay:                                      # store this rollout's windows
+            for w in range(a.seq_batch):
+                buf_xy[filled % a.replay] = seq_xy[w]
+                buf_done[filled % a.replay] = seq_done[w]
+                filled += 1
+        bx, bd = batch(t)
+        x, dn = jnp.asarray(bx), jnp.asarray(bd)
         for _ in range(a.epochs):
             params, batch_stats, opt_state, allo, key, m = step(
                 params, batch_stats, opt_state, allo, key, x, dn)
             updates += 1
             if updates % a.eval_every == 0:
-                span = np.linalg.norm(seq_xy[:, -1] - seq_xy[:, 0], axis=1).mean() * XY_SCALE
+                span = np.linalg.norm(bx[:, -1] - bx[:, 0], axis=1).mean() * XY_SCALE
+                spread = bx.reshape(-1, 2).std(0).mean() * XY_SCALE
                 report(updates, np.asarray(m), t0,
                        f" | env step {t * a.seq_batch:,} visited {int((ant.visited > 0).sum())}/{maze.S} "
-                       f"window span {span:.2f}")
-    span = np.linalg.norm(seq_xy[:, -1] - seq_xy[:, 0], axis=1).mean() * XY_SCALE
+                       f"span {span:.2f} batch spread {spread:.2f}")
+    bx, bd = batch(a.actor_steps)
+    span = np.linalg.norm(bx[:, -1] - bx[:, 0], axis=1).mean() * XY_SCALE
+    spread = bx.reshape(-1, 2).std(0).mean() * XY_SCALE
     report(updates, np.asarray(m), t0,
            f" | env step {a.actor_steps * a.seq_batch:,} visited {int((ant.visited > 0).sum())}/{maze.S} "
-           f"window span {span:.2f}")
+           f"span {span:.2f} batch spread {spread:.2f}")
 
 
 if __name__ == "__main__":
