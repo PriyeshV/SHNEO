@@ -179,9 +179,16 @@ class AntWalk:
     ``push`` returns what NEO_LapXY.fresh_update appends to its window: xy(s_t) and done_t.
     """
 
-    def __init__(self, maze, n_envs, sigma, episode_len, rng, stagger, spawn="start"):
+    def __init__(self, maze, n_envs, sigma, episode_len, rng, stagger, spawn="start",
+                 persistence=0.0):
         self.maze, self.n, self.sigma, self.H, self.rng = maze, n_envs, sigma, episode_len, rng
         self.spawn = spawn
+        # An RND-driven policy does not random-walk: it keeps heading somewhere.  With
+        # persistence p the direction is an AR(1) process, so one step is still sigma long but
+        # successive steps are correlated and the walker travels ballistically rather than
+        # diffusively -- p=0 is the random walk, p->1 is a straight line.
+        self.p = persistence
+        self.vel = rng.normal(size=(n_envs, 2))
         self.pos = self._spawn(n_envs)
         self.age = rng.integers(episode_len, size=n_envs) if stagger else np.zeros(n_envs, int)
         self.visited = np.zeros(maze.S, np.int64)
@@ -196,13 +203,18 @@ class AntWalk:
         xy = self.pos.copy()
         idx = self.maze.sub_index(xy)
         self.visited += np.bincount(idx[idx >= 0], minlength=self.maze.S)
-        cand = self.pos + self.sigma * self.rng.normal(size=(self.n, 2))
+        noise = self.rng.normal(size=(self.n, 2))
+        self.vel = self.p * self.vel + np.sqrt(1.0 - self.p ** 2) * noise
+        cand = self.pos + self.sigma * self.vel
         ok = self.maze.is_free(cand)
+        # A walker that runs into a wall loses the heading that took it there, as an ant would.
+        self.vel = np.where(ok[:, None], self.vel, noise)
         self.pos = np.where(ok[:, None], cand, self.pos)
         self.age += 1
         done = self.age >= self.H
         if done.any():
             self.pos[done] = self._spawn(int(done.sum()))
+            self.vel[done] = self.rng.normal(size=(int(done.sum()), 2))
             self.age[done] = 0
         return xy, done.astype(np.float32)
 
@@ -383,6 +395,10 @@ def main():
                     help="online: world units moved per step; the corridor is 4 wide")
     ap.add_argument("--stagger", action="store_true", help="online: random initial ages, so episodes "
                                                            "do not all reset together")
+    ap.add_argument("--persistence", type=float, default=0.0,
+                    help="online: AR(1) correlation of the step direction, in [0, 1). 0 is a random "
+                         "walk; a driven policy is closer to 0.9, which travels ~1/(1-p) times "
+                         "further per step than it diffuses")
     ap.add_argument("--replay", type=int, default=0,
                     help="online: keep this many past windows and train on a random draw of them "
                          "instead of only the live rollout (0 = the trainer's behaviour). This is "
@@ -442,7 +458,7 @@ def main():
           f"bn={a.batch_norm} d={a.d} barrier_init={a.barrier_init} dual_lr={a.dual_lr}"
           + (f" n_steps={a.n_steps} epochs={a.epochs} zeta={a.zeta}" if a.loss == "shneo" else "")
           + f" spawn={a.spawn} episode_len={a.episode_len}"
-          + (f" sigma={a.sigma} stagger={a.stagger} stride={a.stride} "
+          + (f" sigma={a.sigma} persistence={a.persistence} stagger={a.stagger} stride={a.stride} "
              f"gamma^stride={cfg['gamma']:.4f} replay={a.replay or 'off'}"
              if a.data == "online" else ""))
 
@@ -503,7 +519,7 @@ def main():
     # window is full.  With a stride, a state enters every stride steps and the done flag of the
     # newest entry keeps absorbing the dones of the steps until the next entry.
     K = a.n_steps + 1
-    ant = AntWalk(maze, a.seq_batch, a.sigma, a.episode_len, rng, a.stagger, a.spawn)
+    ant = AntWalk(maze, a.seq_batch, a.sigma, a.episode_len, rng, a.stagger, a.spawn, a.persistence)
     counts = ant.visited                                  # filled in place as the walkers move
     seq_xy = np.zeros((a.seq_batch, K, 2), np.float32)
     seq_done = np.ones((a.seq_batch, K), np.float32)      # SNEOState init: everything masked
