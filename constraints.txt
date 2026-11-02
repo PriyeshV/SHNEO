@@ -1,0 +1,14 @@
+# Compatibility constraints for the archived JAX/Flax stack.
+# These are dependencies of the runtime, not additional direct imports.
+scipy==1.11.4
+orbax-checkpoint==0.4.4
+# Keep the CUDA 12 extra on its original CUDA/cuDNN generation.
+nvidia-cudnn-cu12==8.9.4.25
+nvidia-cublas-cu12==12.2.5.6
+nvidia-cuda-cupti-cu12==12.2.142
+nvidia-cuda-nvcc-cu12==12.2.140
+nvidia-cuda-runtime-cu12==12.2.140
+nvidia-cufft-cu12==11.0.8.103
+nvidia-cusolver-cu12==11.5.2.141
+nvidia-cusparse-cu12==12.1.2.141
+nvidia-nccl-cu12==2.18.3

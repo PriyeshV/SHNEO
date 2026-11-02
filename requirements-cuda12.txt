@@ -1,0 +1,5 @@
+# GPU installation for the archived monolithic CUDA 12 / cuDNN 8.9 JAX build.
+# Use in a fresh environment; do not mix with jax-cuda12-plugin / pjrt.
+--find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+-r requirements.txt
+jax[cuda12_pip]==0.4.23
